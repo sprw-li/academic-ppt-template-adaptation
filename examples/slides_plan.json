@@ -1,0 +1,92 @@
+{
+  "plan_version": "1",
+  "example": true,
+  "example_note": "EXAMPLE ONLY — synthetic slides_plan shape. Not an official case plan, not a prepared answer, not a run result and not a score. Layout names, unit ids, figure ids and contract paths below are invented to show the interface.",
+  "source_path": "paper.md",
+  "template_path": "template.pptx",
+  "start_deck": null,
+  "deck_name": "slides.pptx",
+  "language": "zh",
+  "audience": "EXAMPLE lab group meeting",
+  "time_minutes": 15,
+  "target_slide_count": 3,
+  "confirmed_roles": false,
+  "slides": [
+    {
+      "n": 1,
+      "role": "title",
+      "layout_name": "EXAMPLE 标题幻灯片",
+      "layout_part": "ppt/slideLayouts/slideLayout1.xml",
+      "title": "EXAMPLE 合成标题",
+      "subtitle": "EXAMPLE 合成副标题",
+      "bullets": [],
+      "figures": [],
+      "notes": "EXAMPLE 开场讲稿：说明本页只是接口示例。",
+      "notes_evidence": ["u0001"],
+      "claims": ["EXAMPLE 页级主张：本示例仅演示字段形状。"],
+      "evidence": ["u0001"],
+      "continuation_of": null
+    },
+    {
+      "n": 2,
+      "role": "method",
+      "layout_name": "EXAMPLE 标题和内容",
+      "layout_part": "ppt/slideLayouts/slideLayout2.xml",
+      "title": "EXAMPLE 方法",
+      "subtitle": "",
+      "bullets": [
+        {"text": "EXAMPLE 方法要点一（仅示例文字）", "level": 0, "evidence": ["u0012"]},
+        {"text": "EXAMPLE 方法要点二（仅示例文字）", "level": 1, "evidence": ["u0013"]}
+      ],
+      "figures": [],
+      "notes": "EXAMPLE 讲稿：方法页只引用源单元，不改写正文。",
+      "notes_evidence": ["u0012", "u0013"],
+      "claims": ["EXAMPLE 页级主张：方法由两个源单元支撑。"],
+      "evidence": ["u0012", "u0013"],
+      "continuation_of": null
+    },
+    {
+      "n": 3,
+      "role": "figure",
+      "layout_name": "EXAMPLE 标题和内容",
+      "layout_part": "ppt/slideLayouts/slideLayout2.xml",
+      "title": "EXAMPLE 结果",
+      "subtitle": "",
+      "bullets": [
+        {"text": "EXAMPLE 结果要点（仅示例文字）", "level": 0, "evidence": ["u0044"]}
+      ],
+      "figures": [
+        {
+          "source": "F1",
+          "asset": "fig/fig1.png",
+          "caption": "图1 EXAMPLE 合成图注",
+          "cite": "u0044",
+          "aspect_lock": true
+        }
+      ],
+      "notes": "EXAMPLE 讲稿：图号默认保留源编号，不重写。",
+      "notes_evidence": ["u0044"],
+      "claims": ["EXAMPLE 页级主张：结果由一个源单元和一张图支撑。"],
+      "evidence": ["u0044", "F1"],
+      "continuation_of": null
+    }
+  ],
+  "font_ladder": {
+    "title": [3200, 2800, 2400],
+    "body": [2000, 1800, 1600, 1400],
+    "caption": [1400, 1200],
+    "floor": {"body": 1400, "caption": 1200}
+  },
+  "numbering": {
+    "mode": "preserve_source",
+    "map": ["F1=图1"]
+  },
+  "contract_values": {
+    "delivery.artifacts": "delivery.artifacts"
+  },
+  "notes": [
+    "EXAMPLE: confirmed_roles is false because this synthetic example has no real template or source evidence to confirm roles from.",
+    "EXAMPLE: layout_name/layout_part, unit ids (u0012/u0013/u0044), figure id F1 and the contract_values key are invented for shape only; a real case must use values read from its own template_spec.json / source_inventory.json / case.json.",
+    "EXAMPLE: font_ladder stays at or above common.FONT_FLOOR (title 2400 / body 1400 / caption 1200 / table 1200 / notes 1000, 1/100 pt)."
+  ]
+}
