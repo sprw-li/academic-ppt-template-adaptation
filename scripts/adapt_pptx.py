@@ -24,8 +24,12 @@ import argparse
 import json
 import os
 import re
+import sys
 import zipfile
 from xml.etree import ElementTree as ET
+
+# Importable no matter how we are invoked (script, -m, or installed as a package).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import common as C
 
@@ -583,14 +587,34 @@ class Adapter:
 
     # ---- layout geometry ---------------------------------------------------------
     def body_rect(self, layout_part):
+        """Usable text-body rectangle from the layout, or an honest derived region below the title.
+
+        A Title-Only layout declares no text-body placeholder; reusing the *title* rectangle for
+        the substituted body would print the two on top of each other (observed in
+        work/freeze/t_substitute/out/render/page-0002.png).  So derive a region under the title
+        inside the slide, with a bottom margin, and let the caller record the substitution.
+        """
         meta = self.tpl.layout_meta(layout_part)
-        for kinds in (("body", "obj", "subTitle"), ("title", "ctrTitle")):
-            key, info = pick_placeholder(meta, kinds)
-            if info:
-                r = _usable_rect(info)
-                if r:
-                    return r, key, info
-        return None, None, None
+        key, info = pick_placeholder(meta, ("body", "obj", "subTitle"))
+        if info:
+            r = _usable_rect(info)
+            if r:
+                return r, key, info
+        size = self.tpl.slide_size() or {"cx": 12192000, "cy": 6858000}
+        tkey, tinfo = pick_placeholder(meta, ("ctrTitle", "title"))
+        trect = _usable_rect(tinfo) if tinfo else None
+        gap, margin = 45720, 457200
+        if trect:
+            y = trect["y"] + trect["cy"] + gap
+            cy = max(1, size["cy"] - margin - y)
+            return ({"x": trect["x"], "y": y, "cx": trect["cx"], "cy": cy,
+                     "w_pt": C.emu_to_pt(trect["cx"] - 2 * TEXT_INSET_L),
+                     "h_pt": C.emu_to_pt(cy - 2 * TEXT_INSET_T)}, None, None)
+        cx = max(1, size["cx"] - 2 * margin)
+        cy = max(1, size["cy"] - 2 * margin)
+        return ({"x": margin, "y": margin, "cx": cx, "cy": cy,
+                 "w_pt": C.emu_to_pt(cx - 2 * TEXT_INSET_L),
+                 "h_pt": C.emu_to_pt(cy - 2 * TEXT_INSET_T)}, None, None)
 
     # ---- one slide ---------------------------------------------------------------
     def build_slide(self, plan_slide, *, continuation_of=None, paragraphs=None):
