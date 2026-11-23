@@ -44,6 +44,8 @@ WORK_REQUIRED = ("case_manifest.json", "template_spec.json", "source_inventory.j
 
 # tolerance for non-proportional figure scaling
 ASPECT_TOL = 0.02
+# two text shapes are "overlapping" above this share of the smaller one's area
+OVERLAP_TOL = 0.25
 # a paragraph is "unsourced" when this share of its tokens is absent from allowed text
 UNSOURCED_RATIO = 0.6
 # plan text must land on the deck with at least this token coverage
@@ -103,6 +105,31 @@ def _char_ngrams(s, n=12):
     if len(s) < n:
         return set()
     return {s[i:i + n] for i in range(len(s) - n + 1)}
+
+
+# "statistic-bearing" numeric tokens: decimals, percentages, years, 4+ digit integers and
+# numbers carrying a unit.  Bare 1-3 digit integers are left out on purpose — they are
+# overwhelmingly structural (list/section/page numbering) and would make every deck fail.
+# Only the *numeric core* is used as the token: whether a unit is written adjacent to the
+# number differs between a source paragraph and a slide, so adjacency must not decide.
+_UNIT_ALT = (r"mg/l|kg|km|km/h|m/s|℃|°c|hz|ml|mm|cm|gb|mb|kb|"
+             r"小时|分钟|秒|天|周|个月|年|轮|类|个|段|倍|个百分点|层|条")
+_NUM_CORE = r"(?:\d+\.\d+|\d+(?:\.\d+)?%|(?:19|20)\d{2}|\d{4,})"
+_STAT_RX = re.compile("(%s)(?:%s)?" % (_NUM_CORE, _UNIT_ALT))
+_UNIT_RX = re.compile("\\d+(?:\\.\\d+)?(%s)" % _UNIT_ALT)
+
+
+def _strip_percent(tok):
+    return tok[:-1] if tok.endswith("%") else tok
+
+
+def _stat_tokens(s):
+    """Numeric cores of statistic-bearing tokens (percent sign folded in)."""
+    return set(_strip_percent(m.group(1)) for m in _STAT_RX.finditer(_norm(s)))
+
+
+def _unit_tokens(s):
+    return set(m.group(1) for m in _UNIT_RX.finditer(_norm(s)))
 
 
 def _num_tokens(s):
@@ -263,6 +290,25 @@ _NAME_ROLE_RULES = (
     ("contentplaceholder", "body"), ("substitutedbody", "body"),
     ("textplaceholder", "body"), ("body", "body"),
 )
+
+
+def _layout_font_scale(layout_ph, slide_n, ph):
+    """Inherited ``normAutofit fontScale`` from the slide's layout placeholder (1.0 if none)."""
+    mapping = (layout_ph or {}).get(slide_n) or {}
+    entry = mapping.get((ph or {}).get("idx"))
+    if not entry:
+        return 1.0
+    body_pr = entry.get("body_pr") if isinstance(entry.get("body_pr"), dict) else {}
+    for key in ("normAutofit_fontScale", "font_scale"):
+        v = body_pr.get(key)
+        if isinstance(v, float) and 0 < v <= 1:
+            return v
+        if isinstance(v, int):
+            if 0 < v <= 1:
+                return float(v)
+            if v > 1000:
+                return v / 100000.0
+    return 1.0
 
 
 def _role_and_source(ph, name=None):
@@ -714,35 +760,48 @@ def run_fidelity(work, parts, deck, manifest, inv, plan):
     # A slide deck is a *selective* product: failing because some source number never made
     # it onto a slide would fail every honest deck.  Coverage the other way round is
     # reported as informational (metrics.numeric_coverage) and never affects ``ok``.
-    src_nums = set()
+    src_stats = set()
     for u in units:
-        src_nums |= _num_tokens(u.get("text") or "")
+        src_stats |= _stat_tokens(u.get("text") or "")
     for f in (inv.get("figures") or []) + (inv.get("tables") or []):
         if isinstance(f, dict):
-            src_nums |= _num_tokens(f.get("caption") or "")
-    deck_nums = set()
+            src_stats |= _stat_tokens(f.get("caption") or "")
+    deck_stats = set()
     for txt in deck_by_n.values():
-        deck_nums |= _num_tokens(txt)
-    if not deck_nums:
-        checks.append(_check("numeric_preserved", "skipped", "deck numbers", 0,
-                             "deck contains no numeric tokens"))
+        deck_stats |= _stat_tokens(txt)
+    if not deck_stats:
+        checks.append(_check("numeric_preserved", "skipped", "statistics on the deck", 0,
+                             "deck contains no statistic-bearing numeric token"))
     else:
-        invented = sorted(deck_nums - src_nums)
+        invented = sorted(deck_stats - src_stats)
         checks.append(_check("numeric_preserved", "fail" if invented else "pass",
-                             "every number on the deck appears in the source material",
+                             "every statistic on the deck appears in the source material",
                              len(invented),
-                             "deck numeric tokens=%d invented=%d" % (len(deck_nums), len(invented))))
+                             "deck statistic tokens=%d invented=%d (decimals/percent/units/"
+                             "years/4+digit integers; structural integers excluded)"
+                             % (len(deck_stats), len(invented))))
         for m in invented[:20]:
             violations.append({"kind": "numeric_invented", "slide": None, "text": m,
-                               "why": "number on the deck absent from the source material"})
-    not_on_deck = sorted(src_nums - deck_nums)
-    metrics["numeric_coverage"] = (round((len(src_nums) - len(not_on_deck)) / float(len(src_nums)), 3)
-                                   if src_nums else None)
-    metrics["source_numbers_not_on_deck"] = not_on_deck
+                               "why": "statistic on the deck absent from the source material"})
+    not_on_deck = sorted(src_stats - deck_stats)
+    metrics["numeric_coverage"] = (round((len(src_stats) - len(not_on_deck)) / float(len(src_stats)), 3)
+                                   if src_stats else None)
+    metrics["source_statistics_not_on_deck"] = not_on_deck
     if not_on_deck:
         informational.append({"kind": "numeric_not_on_deck",
-                              "why": "source numbers not selected for any slide (informational)",
+                              "why": "source statistics not selected for any slide (informational)",
                               "count": len(not_on_deck), "sample": not_on_deck[:20]})
+    deck_units, src_units = set(), set()
+    for txt in deck_by_n.values():
+        deck_units |= _unit_tokens(txt)
+    for u in units:
+        src_units |= _unit_tokens(u.get("text") or "")
+    odd_units = sorted(deck_units - src_units)
+    metrics["units_not_in_source"] = odd_units
+    if odd_units:
+        informational.append({"kind": "unit_not_in_source",
+                              "why": "unit wording on the deck absent from the source (informational)",
+                              "sample": odd_units[:20]})
 
     # --- figure_numbering: every 图N/表N used must exist in source labels / numbering map ---
     fig_labels = set()
@@ -910,20 +969,45 @@ CRITICAL = ("master_inheritance", "layout_link_resolves", "placeholder_idx_exist
             "theme_fonts_preserved", "theme_colors_preserved", "slide_size_preserved",
             "text_no_overflow", "font_size_floor", "figure_aspect_ratio",
             "caption_number_consistency", "batch_consistency",
-            "relationships_resolve", "content_types_default_namespace")
+            "relationships_resolve", "content_types_default_namespace", "shape_overlap")
 
 
 def _resolve_template(work, manifest, spec):
-    sha = spec.get("sha256")
+    """Locate the template pptx bytes.
+
+    Candidates, in order: the manifest input whose sha256 matches ``template_spec`` (its
+    absolute path, then the byte-identical copy discover stages under ``<work>/inputs/``),
+    the detected/template rel paths under ``<work>/inputs/``, and finally ``<work>`` itself.
+    The candidate whose sha256 equals ``template_spec.sha256`` wins.
+    """
+    want = spec.get("sha256")
+    cands = []
     for entry in (manifest.get("inputs") or []):
-        if not isinstance(entry, dict):
+        if not isinstance(entry, dict) or entry.get("kind") not in ("pptx", "potx"):
             continue
-        if sha and entry.get("sha256") == sha and entry.get("kind") in ("pptx", "potx"):
-            return entry.get("abs")
-    cand = os.path.join(work, "template.pptx")
-    if os.path.isfile(cand):
-        return cand
-    return None
+        if entry.get("abs"):
+            cands.append(entry["abs"])
+        if entry.get("rel"):
+            cands.append(os.path.join(work, "inputs", entry["rel"]))
+    for rel in ((manifest.get("detected") or {}).get("template") or []):
+        if isinstance(rel, str):
+            cands.append(os.path.join(work, "inputs", rel))
+    for rel in (spec.get("template_path"), spec.get("template")):
+        if isinstance(rel, str) and rel:
+            cands.append(os.path.join(work, "inputs", rel))
+            cands.append(os.path.join(work, rel))
+    cands.append(os.path.join(work, "template.pptx"))
+
+    existing = [c for c in cands if c and os.path.isfile(c)]
+    if want:
+        for c in existing:
+            try:
+                if common.sha256_file(c) == want:
+                    return c
+            except Exception:
+                continue
+    # no sha match: still better to compare against a real template than to skip
+    return existing[0] if existing else None
 
 
 def run_format(work, output, parts, deck, manifest, spec, plan):
@@ -964,48 +1048,98 @@ def run_format(work, output, parts, deck, manifest, spec, plan):
                              list(want_size), list(deck_size),
                              "ppt/presentation.xml/p:sldSz"))
 
-    # ---- master inheritance ----
+    # ---- master inheritance: byte-for-byte, never "the part name exists" ----
+    # "the template was really applied" is the headline claim of this task, so existence of
+    # ppt/slideMasters/*.xml is not evidence: the bytes must match the template's.
     template_path = _resolve_template(work, manifest, spec)
-    tparts = {}
+    tparts_real = {}
+    template_sha = None
     if template_path and os.path.isfile(template_path):
+        template_sha = common.sha256_file(template_path)
         try:
             with zipfile.ZipFile(template_path) as z:
-                tparts = {n: z.read(n) for n in z.namelist()}
+                tparts_real = {n: z.read(n) for n in z.namelist()}
         except Exception:
-            tparts = {}
-    needed = []
+            tparts_real = {}
+
+    def _is_inherited_part(name):
+        return bool(re.match(r"^ppt/(slideMasters|slideLayouts|theme|notesMasters)/", name))
+
+    tpl_inherited = sorted(n for n in tparts_real if _is_inherited_part(n))
+    spec_needed = []
     for m in spec.get("masters") or []:
         if isinstance(m, dict):
             if m.get("part"):
-                needed.append(m["part"])
+                spec_needed.append(m["part"])
             if m.get("theme_rel"):
-                needed.append(m["theme_rel"])
+                spec_needed.append(m["theme_rel"])
             for lay in m.get("layouts") or []:
-                needed.append(lay)
+                spec_needed.append(lay)
     for t in spec.get("theme") or []:
         if isinstance(t, dict) and t.get("part"):
-            needed.append(t["part"])
-    needed = sorted(set(needed))
-    if not needed:
+            spec_needed.append(t["part"])
+    spec_needed = sorted(set(spec_needed))
+
+    inherit_bytes = {"template": template_path, "template_sha256": template_sha,
+                     "compared": 0, "identical": 0, "mismatched": [], "missing": []}
+    if not tpl_inherited:
         vacuous += 1
-        skip("master_inheritance", "template_spec lists no master/layout/theme parts")
+        skip("master_inheritance",
+             "template bytes unavailable for comparison (%s)"
+             % ("template not found" if not template_path else "template unreadable/not a pptx"))
     else:
-        missing = [n for n in needed if n not in parts]
-        identical = 0
-        compared = 0
-        for n in needed:
-            if tparts and n in tparts and n in parts:
-                compared += 1
-                if common.sha256_bytes(tparts[n]) == common.sha256_bytes(parts[n]):
-                    identical += 1
-        checks.append(_check("master_inheritance", "fail" if missing else "pass",
-                             "%d template parts present" % len(needed), len(needed) - len(missing),
-                             "missing=%s; bytes_compared=%d bytes_identical=%d"
-                             % (missing[:5], compared, identical),
-                             evidence=needed[:12]))
+        for n in tpl_inherited:
+            if n not in parts:
+                inherit_bytes["missing"].append(n)
+                continue
+            inherit_bytes["compared"] += 1
+            ts = common.sha256_bytes(tparts_real[n])
+            ds = common.sha256_bytes(parts[n])
+            if ts == ds:
+                inherit_bytes["identical"] += 1
+            else:
+                inherit_bytes["mismatched"].append({"part": n, "template_sha256": ts,
+                                                    "deck_sha256": ds})
+        missing = [n for n in spec_needed if n not in parts]
+        bad = inherit_bytes["missing"] or inherit_bytes["mismatched"] or missing
+        checks.append(_check("master_inheritance", "fail" if bad else "pass",
+                             "every inherited part (%d) is byte-identical to the template"
+                             % len(tpl_inherited),
+                             {"compared": inherit_bytes["compared"],
+                              "identical": inherit_bytes["identical"],
+                              "mismatched": len(inherit_bytes["mismatched"]),
+                              "missing": len(inherit_bytes["missing"]) + len(missing)},
+                             "template=%s sha256=%s; compared=%d identical=%d mismatched=%s "
+                             "missing=%s"
+                             % (template_path, (template_sha or "")[:16],
+                                inherit_bytes["compared"], inherit_bytes["identical"],
+                                [m["part"] for m in inherit_bytes["mismatched"][:5]],
+                                (inherit_bytes["missing"] + missing)[:5]),
+                             evidence=tpl_inherited[:12]))
+        if inherit_bytes["mismatched"]:
+            checks[-1]["detail_extra"] = inherit_bytes["mismatched"][:10]
+
+    def _part_identical(name):
+        if name and name in tparts_real and name in parts:
+            return common.sha256_bytes(tparts_real[name]) == common.sha256_bytes(parts[name])
+        return None
+
     for sl in deck:
-        inheritance.append({"slide": sl["n"], "layout": sl["layout"],
-                            "master": None, "theme": None,
+        lp = sl.get("layout")
+        mpart = None
+        if lp and lp in parts:
+            mrels = [x for x in _parse_rels(parts, lp) if x[1].endswith("/slideMaster")]
+            mpart = mrels[0][4] if mrels and mrels[0][4] else None
+        thpart = None
+        if mpart and mpart in parts:
+            trels = [x for x in _parse_rels(parts, mpart) if x[1].endswith("/theme")]
+            thpart = trels[0][4] if trels and trels[0][4] else None
+        per_part = {"layout": _part_identical(lp), "master": _part_identical(mpart),
+                    "theme": _part_identical(thpart)}
+        known = [v for v in per_part.values() if v is not None]
+        inheritance.append({"slide": sl["n"], "layout": lp, "master": mpart, "theme": thpart,
+                            "byte_identical": (all(known) if known else None),
+                            "byte_identical_parts": per_part,
                             "placeholder_idx": [sh["ph"]["idx"] for sh in sl["shapes"]
                                                 if sh.get("ph")]})
 
@@ -1258,8 +1392,10 @@ def run_format(work, output, parts, deck, manifest, spec, plan):
                 sz = default_sz.get(sh.get("role"), 1600)
             font_pt = sz / 100.0
             scale = sh.get("autofit")
+            if not scale:
+                scale = _layout_font_scale(layout_ph, sl["n"], ph)
             if scale:
-                font_pt = font_pt * scale
+                font_pt = font_pt * float(scale)
             lins = (sh["paras"][0]["lnSpc"] if sh["paras"] and sh["paras"][0]["lnSpc"] else 1.2)
             l, r, t, b = _insets(_bodypr(sh["txbody"]) if sh["txbody"] is not None else None)
             box_w = common.emu_to_pt(max(x["cx"] - l - r, 0))
@@ -1284,6 +1420,10 @@ def run_format(work, output, parts, deck, manifest, spec, plan):
                              "shapes measured=%d overflow=%d" % (meas, len(overflow))))
 
     # ---- font size floor ----
+    # The *effective* size is what the audience sees: a run declared 18pt inside a shape
+    # whose <a:bodyPr><a:normAutofit fontScale="50000"/> shrinks it renders at 9pt.
+    # Squeezing text unreadable to defeat overflow is exactly the failure mode this task
+    # names, so the floor is applied to declared_sz * fontScale, never to declared_sz alone.
     # plan font_ladder floors are OOXML 1/100 pt; tolerate a pt value just in case
     def _as_100pt(v, default):
         try:
@@ -1298,6 +1438,8 @@ def run_format(work, output, parts, deck, manifest, spec, plan):
               "table": common.FONT_FLOOR["table"], "meta": 800}
     viol = []
     runs_checked = 0
+    scaled_shapes = []
+
     for sl in deck:
         for sh in sl["shapes"]:
             if sh["kind"] != "sp":
@@ -1305,20 +1447,38 @@ def run_format(work, output, parts, deck, manifest, spec, plan):
             role = sh.get("role")
             if role not in floors:
                 continue
+            scale = sh.get("autofit")
+            if not scale:
+                scale = _layout_font_scale(layout_ph, sl["n"], sh.get("ph"))
+            scale = float(scale or 1.0)
+            if scale != 1.0:
+                scaled_shapes.append({"slide": sl["n"], "shape": sh.get("name"),
+                                      "font_scale": scale})
             for para in sh["paras"]:
                 for sz in para["sizes"]:
                     runs_checked += 1
-                    if sz < floors[role]:
-                        viol.append({"slide": sl["n"], "shape": sh.get("name"),
-                                     "role": role, "sz_1_100pt": sz,
+                    eff = sz * scale
+                    if eff < floors[role]:
+                        viol.append({"slide": sl["n"], "shape": sh.get("name"), "role": role,
+                                     "declared_sz": sz, "font_scale": round(scale, 5),
+                                     "effective_pt": round(eff / 100.0, 2),
+                                     "floor_pt": round(floors[role] / 100.0, 2),
+                                     "declared_sz_1_100pt": sz,
                                      "floor_1_100pt": floors[role]})
     if not runs_checked:
         vacuous += 1
         skip("font_size_floor", "no explicit run sizes on the deck")
     else:
         checks.append(_check("font_size_floor", "fail" if viol else "pass",
-                             "every run >= role floor", len(viol),
-                             "runs checked=%d below floor=%d" % (runs_checked, len(viol))))
+                             "effective size (declared_sz x normAutofit fontScale) >= role floor",
+                             len(viol),
+                             "runs checked=%d below floor=%d; shapes with fontScale=%d; "
+                             "effective size = sz x fontScale/100000"
+                             % (runs_checked, len(viol), len(scaled_shapes))))
+        if viol:
+            checks[-1]["detail_extra"] = sorted(viol, key=lambda v: v["effective_pt"])[:10]
+        if scaled_shapes:
+            checks[-1]["font_scale_applied"] = scaled_shapes[:10]
 
     # ---- batch consistency ----
     groups = {}
@@ -1362,6 +1522,77 @@ def run_format(work, output, parts, deck, manifest, spec, plan):
                              fails, "layout inconsistencies=%d size-hierarchy=%d"
                              % (len(inconsistent), len(size_viol))))
 
+    # ---- shape overlap: two text-bearing shapes printed on top of each other ----
+    # Complements text_no_overflow: overflow is "text leaves its own box", overlap is
+    # "two boxes intersect".  Rects inherited from the same layout placeholder are a
+    # legitimate co-location and are skipped.
+    overlap = []
+    dup_notes = []
+    pairs_checked = 0
+    master_ph_cache = {}
+    for sl in deck:
+        pmap = layout_ph.get(sl["n"]) or {}
+        mmap = {}
+        if sl.get("layout"):
+            mrels = [x for x in _parse_rels(parts, sl["layout"]) if x[1].endswith("/slideMaster")]
+            mpart = mrels[0][4] if mrels and mrels[0][4] else None
+            if mpart:
+                if mpart not in master_ph_cache:
+                    master_ph_cache[mpart] = _master_ph_map(parts, mpart)
+                mmap = master_ph_cache[mpart]
+        items = []
+        seen_ph = set()
+        for sh in sl["shapes"]:
+            if sh["kind"] != "sp":
+                continue
+            text = "\n".join(p["text"] for p in sh["paras"] if (p["text"] or "").strip())
+            if not text.strip():
+                continue
+            ph = sh.get("ph") or {}
+            rect = sh.get("xfrm")
+            if rect is None and ph.get("idx") in pmap:
+                rect = pmap[ph["idx"]].get("xfrm")
+            if rect is None and ph.get("idx") in mmap:
+                # placeholders commonly inherit their rectangle from the master
+                rect = mmap[ph["idx"]].get("xfrm")
+            if rect is None or not rect.get("cx") or not rect.get("cy"):
+                continue
+            key = (ph.get("type"), ph.get("idx")) if ph else None
+            if key is not None:
+                if key in seen_ph:
+                    dup_notes.append({"slide": sl["n"], "placeholder": list(key)})
+                seen_ph.add(key)
+            items.append({"name": sh.get("name") or (ph.get("type") or "shape"),
+                          "rect": rect, "ph_key": key})
+        for i in range(len(items)):
+            for j in range(i + 1, len(items)):
+                a, b = items[i], items[j]
+                if a["ph_key"] and a["ph_key"] == b["ph_key"]:
+                    continue
+                ra, rb = a["rect"], b["rect"]
+                pairs_checked += 1
+                ix = min(ra["x"] + ra["cx"], rb["x"] + rb["cx"]) - max(ra["x"], rb["x"])
+                iy = min(ra["y"] + ra["cy"], rb["y"] + rb["cy"]) - max(ra["y"], rb["y"])
+                if ix <= 0 or iy <= 0:
+                    continue
+                denom = min(ra["cx"] * ra["cy"], rb["cx"] * rb["cy"]) or 1
+                ratio = (ix * iy) / float(denom)
+                if ratio > OVERLAP_TOL:
+                    overlap.append({"slide": sl["n"], "a": a["name"], "b": b["name"],
+                                    "overlap_ratio": round(ratio, 3),
+                                    "rects": {"a": ra, "b": rb}})
+    if not pairs_checked:
+        vacuous += 1
+        skip("shape_overlap", "no two text-bearing shapes with resolvable rectangles")
+    else:
+        checks.append(_check("shape_overlap", "fail" if overlap else "pass",
+                             "no two text shapes overlap > %.2f of the smaller area" % OVERLAP_TOL,
+                             len(overlap),
+                             "overlapping pairs=%d of %d pairs checked; duplicate placeholders=%d"
+                             % (len(overlap), pairs_checked, len(dup_notes))))
+        if overlap:
+            checks[-1]["detail_extra"] = overlap[:10]
+
     role_sources = {}
     for sl in deck:
         for sh in sl["shapes"]:
@@ -1376,10 +1607,17 @@ def run_format(work, output, parts, deck, manifest, spec, plan):
         "checks": checks,
         "overflow": overflow,
         "aspect": aspect,
+        "overlap": overlap,
+        "duplicate_placeholders": dup_notes,
         "inheritance": inheritance,
+        "inheritance_bytes": inherit_bytes,
         "unchecked": [{"name": c["name"], "reason": c["detail"]}
                       for c in checks if c["status"] == "skipped"],
         "role_resolution": role_sources,
+        "font_scale": {"shapes_with_font_scale": scaled_shapes[:40],
+                       "count": len(scaled_shapes),
+                       "note": "font_size_floor and text_no_overflow use declared_sz x "
+                               "normAutofit fontScale/100000 as the effective size"},
         "vacuous_skips": vacuous,
         "generated_at": _now(),
         "note": "skipped != pass; unchecked items never count as PASS.",
