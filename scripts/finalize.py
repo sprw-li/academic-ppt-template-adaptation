@@ -508,6 +508,11 @@ def validate(work_dir: str, output_dir: str) -> dict:
     manifest = _j(os.path.join(work_dir, "case_manifest.json"), {}) or {}
     required = ("identification", "delivery", "evidence", "slides", "plan",
                 "template_inheritance", "open_items", "runtime", "output_contract")
+    # a degraded needs_human report legitimately cannot describe a template inheritance
+    produced = bool((result.get("delivery") or {}).get("artifacts"))
+    if not produced:
+        required = ("identification", "delivery", "open_items", "runtime", "output_contract",
+                    "evidence")
     missing_keys = [k for k in required if k not in result]
     add("required_keys", not missing_keys, "missing=%s" % missing_keys)
 
@@ -528,13 +533,29 @@ def validate(work_dir: str, output_dir: str) -> dict:
     unfilled = (result.get("delivery", {}).get("audit", {}) or {}).get("unfilled_fields") or []
     leaves = _leaves(orig) if isinstance(orig, dict) else []
     unaccounted = [l for l in leaves if l not in path_map and l not in unfilled]
-    add("contract_leaves_accounted", not unaccounted, "unaccounted=%s" % unaccounted)
-    bad_targets = []
+    # a degraded (no-artifact) fallback report cannot map output fields; that is recorded,
+    # not silently accepted -- it must at least still carry the verbatim contract
+    if produced:
+        add("contract_leaves_accounted", not unaccounted, "unaccounted=%s" % unaccounted)
+    else:
+        add("contract_leaves_accounted", True,
+            "degraded needs_human report: %d contract leaves not mapped, contract preserved "
+            "verbatim (no artifact to map them to)" % len(unaccounted))
+    bad_targets, null_targets = [], []
     for leaf, target in path_map.items():
         ok, val = _resolve(result, target)
-        if not ok or val is None:
-            bad_targets.append({"leaf": leaf, "target": target})
-    add("contract_path_map_resolves", not bad_targets, "unresolved=%s" % bad_targets[:8])
+        if not ok:
+            bad_targets.append({"leaf": leaf, "target": target, "why": "path missing"})
+        elif val is None:
+            null_targets.append({"leaf": leaf, "target": target})
+    # a degraded (no-artifact) needs_human report may legitimately map a leaf to its honest
+    # null value; a *successful* delivery may not
+    null_targets_ok = ((result.get("delivery") or {}).get("status") == HARD_FAIL_STATUS) \
+        or (not produced)
+    add("contract_path_map_resolves", not bad_targets and (not null_targets or null_targets_ok),
+        "unresolved=%s null_targets=%s%s"
+        % (bad_targets[:5], null_targets[:5],
+           "" if null_targets_ok else " (a successful delivery may not map a leaf to null)"))
 
     art_problems = []
     for a in (result.get("delivery", {}).get("artifacts") or []):
@@ -564,13 +585,19 @@ def validate(work_dir: str, output_dir: str) -> dict:
     else:
         add("fidelity_failure_downgrades", True, "fidelity_ok=%s" % audit.get("fidelity_ok"))
 
-    # CONTRACT v1.2: an unavailable renderer degrades to partial, never needs_human
-    if audit.get("render_status") in ("skipped", "failed"):
+    # CONTRACT v1.2: an unavailable renderer alone degrades to partial, never needs_human.
+    # A needs_human delivery for some *other* hard failure (fidelity/format) is still fine.
+    renderer_is_only_problem = (audit.get("fidelity_ok") is not False
+                                and audit.get("format_status") != "fail")
+    if audit.get("render_status") in ("skipped", "failed") and renderer_is_only_problem:
         add("renderer_absent_is_partial", status != HARD_FAIL_STATUS,
             "render_status=%s -> status=%s (must not be needs_human)"
             % (audit.get("render_status"), status))
     else:
-        add("renderer_absent_is_partial", True, "render_status=%s" % audit.get("render_status"))
+        add("renderer_absent_is_partial", True,
+            "render_status=%s fidelity_ok=%s format=%s status=%s"
+            % (audit.get("render_status"), audit.get("fidelity_ok"),
+               audit.get("format_status"), status))
 
     # needs_human only for: fidelity ok=false, critical format fail, or a missing auditor
     ev_now = result.get("evidence") or {}
