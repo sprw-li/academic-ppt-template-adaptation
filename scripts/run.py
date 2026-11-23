@@ -25,6 +25,8 @@ import os
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import common as C
 
 PLAN = "slides_plan.json"
@@ -46,10 +48,12 @@ def _steps():
     return []
 
 
-def _pipeline(stage, started, steps, status, outputs=None):
+def _pipeline(stage, started, steps, status, outputs=None, stages=None):
     rec = {"stage": stage, "status": status, "started": started, "ended": C.now_iso(),
            "wall_s": round(time.time() - started, 3), "steps": steps,
            "outputs": outputs or []}
+    if stages:
+        rec["stages"] = stages
     return rec
 
 
@@ -401,7 +405,7 @@ def resolve_plan(work):
     return derived, res
 
 
-def stage_finish(work, output):
+def stage_finish(work, output, prepare_s=None):
     steps = []
     started = time.time()
     C.ensure_dir(work)
@@ -449,6 +453,11 @@ def stage_finish(work, output):
                             if isinstance((rnd or {}).get("renderer"), dict) else str((rnd or {}).get("renderer"))})
 
     rec = _pipeline("finish", started, steps, "ok")
+    # The per-stage split must exist *before* finalize reads pipeline_report.json, otherwise
+    # result.json.runtime cannot report a real prepare duration.
+    rec["stages"] = ([{"stage": "prepare", "wall_s": prepare_s}] if prepare_s is not None else []) + \
+        [{"stage": "finish", "wall_s": rec["wall_s"], "measured": "through_audit"}]
+    rec["prepare_wall_s"] = prepare_s
     C.write_json(os.path.join(work, PIPELINE), rec)
     finalize.build(work, output)
     val = finalize.validate(work, output)
@@ -488,6 +497,12 @@ def _fallback_result(work, output, plan, resolution, status, detail):
         "runtime": {"python": sys.version.split()[0], "detail": detail},
         "output_contract": man.get("output_contract") or {},
     }
+    # §6.1: even the degraded report keeps the original contract snapshot, a path map for the
+    # leaves we can fill, and an explicit list of the leaves we cannot — nothing is silently dropped.
+    mapped = _contract_values(man)
+    unfilled = [l for l in _leaves(result["output_contract"]) if l not in mapped]
+    result["contract_path_map"] = mapped
+    result["delivery"]["audit"]["unfilled_fields"] = unfilled
     C.write_json(os.path.join(output, "result.json"), result)
 
 
@@ -511,12 +526,24 @@ def main(argv=None):
     elif args.stage == "finish":
         res, code = stage_finish(args.work, args.output)
     else:
+        t0 = time.time()
         res, code = stage_prepare(args.input, args.work, args.output)
+        prepare_s = round(time.time() - t0, 3)
         if code != 0 and not os.path.exists(os.path.join(args.work, "case_manifest.json")):
             C.log("prepare failed hard: %s" % res.get("detail"), "fatal")
             return code
-        res2, code = stage_finish(args.work, args.output)
-        res = {"prepare": res, "finish": res2}
+        t1 = time.time()
+        res2, code = stage_finish(args.work, args.output, prepare_s=prepare_s)
+        finish_s = round(time.time() - t1, 3)
+        # final, complete per-stage record (finalize already read the earlier, honest version)
+        pres = _j(args.work, PIPELINE, {}) or {}
+        pres["stages"] = [{"stage": "prepare", "wall_s": prepare_s},
+                          {"stage": "finish", "wall_s": finish_s, "measured": "complete"}]
+        pres["prepare_wall_s"] = prepare_s
+        pres["finish_wall_s"] = finish_s
+        C.write_json(os.path.join(args.work, PIPELINE), pres)
+        res = {"prepare": res, "finish": res2,
+               "stages": pres["stages"]}
     C.log("stage=%s exit=%d" % (args.stage, code))
     print(json.dumps(res, ensure_ascii=False, indent=2, default=str))
     return code
