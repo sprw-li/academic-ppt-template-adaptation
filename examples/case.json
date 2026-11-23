@@ -1,0 +1,53 @@
+{
+  "example": true,
+  "example_id": "EXAMPLE-ppt-710fbc72-001",
+  "example_note": "EXAMPLE ONLY — synthetic interface illustration. Not an official case, not a prepared answer, not a run result and not a score. No template, paper or figure bytes exist for this example; every material is marked available_in_this_example=false.",
+  "case_id": "EXAMPLE-ppt-710fbc72-001",
+  "task_type": "academic_ppt_template_adaptation",
+  "materials": [
+    {"rel": "template.pptx", "kind": "pptx", "role_hint": "template", "available_in_this_example": false},
+    {"rel": "paper.md", "kind": "md", "role_hint": "source", "available_in_this_example": false},
+    {"rel": "fig/fig1.png", "kind": "png", "role_hint": "figure", "available_in_this_example": false},
+    {"rel": "start_deck.pptx", "kind": "pptx", "role_hint": "start_deck", "available_in_this_example": false}
+  ],
+  "instructions": "EXAMPLE instruction text. Build a 15-minute, roughly 3-slide academic talk from paper.md into template.pptx: keep the source figure numbering, add speaker notes, and export a real preview. This text is synthetic and must not be reused as a real case instruction.",
+  "output_contract": {
+    "identification": {
+      "case_id": "EXAMPLE-ppt-710fbc72-001",
+      "title": "EXAMPLE deck title",
+      "audience": "EXAMPLE lab group meeting"
+    },
+    "delivery": {
+      "primary_output": "slides.pptx",
+      "editable": true,
+      "with_notes": true,
+      "preview": {"pdf": "preview/slides.pdf", "png_dir": "preview"},
+      "artifacts": [
+        {"rel": "slides.pptx", "kind": "pptx", "editable": true},
+        {"rel": "preview/slides.pdf", "kind": "pdf", "rendered": true}
+      ]
+    },
+    "evidence": {
+      "slide_evidence_map": "slides_plan.json",
+      "template_inheritance": "result.json.template_inheritance",
+      "fidelity": "evidence/fidelity_report.json",
+      "format_audit": "evidence/format_audit.json",
+      "render": "evidence/render_report.json",
+      "change_records": "evidence/change_records.jsonl"
+    },
+    "open_items": {
+      "uncertainty": [],
+      "limitations": []
+    },
+    "runtime": {
+      "budget": {"model_requests": 64, "seconds": 900},
+      "language": "zh"
+    }
+  },
+  "constraints": [
+    "EXAMPLE constraint: the delivered pptx must show a verifiable template master/layout/theme inheritance chain.",
+    "EXAMPLE constraint: never shrink text below the readable floor; split the slide instead.",
+    "EXAMPLE constraint: figures keep their aspect ratio and their source numbering by default.",
+    "EXAMPLE constraint: report honest status, uncertainty and change records; do not fabricate previews."
+  ]
+}
