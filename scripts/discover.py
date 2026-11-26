@@ -193,9 +193,14 @@ def _record_caption(entry, unit_record, locator, source_ref, figures, tables):
         "source_ref": source_ref,
         "locator": locator,
         "unit": unit_record["id"],
+        "section": unit_record.get("section"),
     }
     if entry["kind"] == "figure":
         item.update({"asset": None, "width": None, "height": None})
+    else:
+        # v1.3: real cell data is attached later by ``_attach_table_data``; until then the
+        # lists stay empty ("no invented cells") and ``data_note`` explains why.
+        item.update({"header": [], "rows": [], "data_source": None, "data_note": None})
     if entry.get("truncated"):
         item["caption_truncated"] = True
     registry.append(item)
@@ -619,12 +624,187 @@ def _gcd(a, b):
     return a or 1
 
 
+# --------------------------------------------------------------------------------------
+# starting deck: per-slide content detail (ADDENDUM v1.3 §A1; everything from real bytes)
+# --------------------------------------------------------------------------------------
+
+_TITLE_PH_TYPES = ("title", "ctrTitle")
+_BODY_PH_TYPES = ("body", "obj", "subTitle")
+
+
+def _where_of_ph_type(ph_type):
+    """Map a real placeholder type onto the A1 ``where`` vocabulary."""
+    if ph_type in _TITLE_PH_TYPES:
+        return "title"
+    if ph_type in _BODY_PH_TYPES:
+        return "body"
+    return "other"
+
+
+def _signature_kind(ph_type):
+    """Normalised placeholder kind used for the A1 ``placeholder_signature`` list."""
+    if ph_type in _TITLE_PH_TYPES:
+        return "title"
+    if ph_type in _BODY_PH_TYPES:
+        return "body"
+    return ph_type
+
+
+def _iter_sp_tree_children(elem):
+    """Yield shape-level children of a ``p:spTree`` in document order, descending groups."""
+    if elem is None:
+        return
+    for child in list(elem):
+        local = common.localname(child.tag)
+        if local in ("sp", "pic", "graphicFrame", "grpSp", "cxnSp", "contentPart"):
+            yield child
+            if local == "grpSp":
+                for nested in _iter_sp_tree_children(child):
+                    yield nested
+
+
+def _paragraph_text_units(container, where):
+    """``[{text, where, level}]`` for every non-empty paragraph of one shape/body."""
+    units = []
+    if container is None:
+        return units
+    body = container.find("p:txBody", NS)
+    if body is None:
+        return units
+    for para in body.findall("a:p", NS):
+        text = "".join((node.text or "") for node in para.iter("{%s}t" % A)).strip()
+        if not text:
+            continue
+        ppr = para.find("a:pPr", NS)
+        level = 0
+        if ppr is not None and ppr.get("lvl") is not None:
+            try:
+                level = int(ppr.get("lvl"))
+            except (TypeError, ValueError):
+                level = 0
+        units.append({"text": text, "where": where, "level": level})
+    return units
+
+
+def _shape_text_units(shape):
+    """Text units of a real shape, deciding ``where`` from its actual placeholder type."""
+    ph = shape.find("p:nvSpPr/p:nvPr/p:ph", NS)
+    if ph is not None:
+        _idx, ph_type = _ph_key(ph)
+        where = _where_of_ph_type(ph_type)
+    else:
+        where = "other"
+    return _paragraph_text_units(shape, where)
+
+
+def _slide_picture_records(zf, slide_root, slide_part):
+    """Real picture bytes referenced by a slide (``rel`` is the media part in the package)."""
+    rels = _read_rels(zf, slide_part)
+    pictures = []
+    for node in slide_root.iter("{%s}pic" % P):
+        blip = node.find("p:blipFill/a:blip", NS)
+        rid = blip.get("{%s}embed" % R) if blip is not None else None
+        rel = rels.get(rid or "")
+        target = rel.get("part") if rel else None
+        if not target:
+            pictures.append({"rel": None, "rid": rid, "sha256": None, "width": None, "height": None,
+                             "note": "picture has no resolvable image relationship"})
+            continue
+        try:
+            data = zf.read(target)
+        except (KeyError, OSError) as exc:
+            pictures.append({"rel": target, "rid": rid, "sha256": None, "width": None, "height": None,
+                             "note": "image part could not be read: %s" % exc})
+            continue
+        kind = common.guess_kind(target)
+        size = common.natural_size(data, kind)
+        pictures.append({
+            "rel": target, "rid": rid, "sha256": common.sha256_bytes(data),
+            "width": size[0] if size else None, "height": size[1] if size else None,
+            "bytes": len(data),
+        })
+    return pictures
+
+
+def _slide_table_records_from_frame(frame):
+    """Real table geometry + cell text of one ``p:graphicFrame``.
+
+    Returns ``(records, cell_text_units)`` where ``records`` only carries real counts
+    (``a:tr``/``a:tc``); no cell is invented when a table has no ``<a:tbl>``.
+    """
+    records, cell_units = [], []
+    tbl = frame.find("a:graphic/a:graphicData/a:tbl", NS)
+    if tbl is None:
+        return records, cell_units
+    rows = tbl.findall("a:tr", NS)
+    cols = 0
+    for row in rows:
+        cols = max(cols, len(row.findall("a:tc", NS)))
+    records.append({"rows": len(rows), "cols": cols})
+    for row_number, row in enumerate(rows, 1):
+        for cell_number, cell in enumerate(row.findall("a:tc", NS), 1):
+            text = "".join((node.text or "") for node in cell.iter("{%s}t" % A)).strip()
+            if text:
+                cell_units.append({
+                    "text": text, "where": "other", "level": 0,
+                    "in_table": True,
+                    "cell": "%d,%d" % (row_number, cell_number),
+                })
+    return records, cell_units
+
+
+def _slide_notes_text(zf, slide_part, notes_cache):
+    """Speaker-note text of a slide (empty string when the slide has no notes part)."""
+    rels = _read_rels(zf, slide_part)
+    for rel in rels.values():
+        if not rel["type"].endswith("/notesSlide") or not rel.get("part"):
+            continue
+        part = rel["part"]
+        if part in notes_cache:
+            return notes_cache[part]
+        root = common.load_zip_xml(zf, part)
+        texts = []
+        if root is not None:
+            for sp in root.iter("{%s}sp" % P):
+                for para in _paragraph_text_units(sp, "other"):
+                    texts.append(para["text"])
+        text = "\n".join(texts).strip()
+        notes_cache[part] = text
+        return text
+    return ""
+
+
+def _slide_layout_probe(zf, slide_part):
+    """``(raw target, resolved part)`` of the slide's real ``slideLayout`` relationship."""
+    for rel in _read_rels(zf, slide_part).values():
+        if rel["type"].endswith("/slideLayout"):
+            return rel.get("target"), rel.get("part")
+    return None, None
+
+
 def start_deck_spec(path, rel, sha):
-    """Minimal, honest inventory of an optional starting deck (no plan decisions here)."""
-    spec = {"path": rel, "sha256": sha, "ok": False, "slides": 0, "slide_titles": [], "notes": []}
+    """Honest content inventory of an optional starting deck (ADDENDUM v1.3 §A1).
+
+    v1.2 keys (``path/sha256/ok/slides/slide_titles/notes``) are kept byte for byte in
+    meaning; v1.3 adds ``slide_details[]`` and the aggregate counters. Every value comes
+    from real package bytes; a broken package yields ``ok=false`` plus the reason and
+    never raises.
+    """
+    spec = {
+        "path": rel, "sha256": sha, "ok": False,
+        "slides": 0, "slide_titles": [],
+        "slide_details": [],
+        "slide_count": 0, "has_pictures": False, "has_tables": False, "notes_count": 0,
+        "notes": [],
+    }
     try:
         with zipfile.ZipFile(path) as zf:
             names = zf.namelist()
+            if "[Content_Types].xml" not in names or "_rels/.rels" not in names:
+                raise DiscoveryError("package lacks [Content_Types].xml or _rels/.rels")
+            bad = zf.testzip()
+            if bad:
+                raise DiscoveryError("CRC failure in member %s" % bad)
             pres_part = None
             for rel_entry in _read_rels(zf, "").values():
                 if rel_entry["type"] == REL_OFFICE_DOCUMENT and rel_entry.get("part"):
@@ -633,9 +813,11 @@ def start_deck_spec(path, rel, sha):
             if not pres_part or pres_part not in names:
                 raise DiscoveryError("no presentation part")
             pres = common.load_zip_xml(zf, pres_part)
+            if pres is None:
+                raise DiscoveryError("presentation part is not parseable XML")
             pres_rels = _read_rels(zf, pres_part)
             slide_parts = []
-            id_lst = _child(pres, "p:sldIdLst") if pres is not None else None
+            id_lst = _child(pres, "p:sldIdLst")
             if id_lst is not None:
                 for el in id_lst:
                     if common.localname(el.tag) != "sldId":
@@ -643,22 +825,91 @@ def start_deck_spec(path, rel, sha):
                     rel_entry = pres_rels.get(el.get("{%s}id" % R) or "")
                     if rel_entry and rel_entry.get("part"):
                         slide_parts.append(rel_entry["part"])
-            spec["slides"] = len(slide_parts)
-            for part in slide_parts:
+            layout_name_cache = {}
+            notes_cache = {}
+            for index, part in enumerate(slide_parts, 1):
+                slide_titles_entry = {"part": part, "title": None}
+                detail = {
+                    "index": index,
+                    "part": part,
+                    "layout": None,
+                    "layout_probe": None,
+                    "layout_name": None,
+                    "placeholder_signature": [],
+                    "placeholder_types": [],
+                    "title": None,
+                    "text_units": [],
+                    "pictures": [],
+                    "notes": "",
+                    "tables": [],
+                }
                 root = common.load_zip_xml(zf, part)
                 if root is None:
                     spec["notes"].append("slide part %s is not parseable" % part)
+                    detail["parse_note"] = "slide part is not parseable XML"
+                    spec["slide_titles"].append(slide_titles_entry)
+                    spec["slide_details"].append(detail)
                     continue
+                c_sld = _child(root, "p:cSld")
+                sp_tree = _child(c_sld, "p:spTree") if c_sld is not None else None
+                signature, types = [], []
+                for shape in _iter_sp_tree_children(sp_tree):
+                    local = common.localname(shape.tag)
+                    if local == "sp":
+                        ph = shape.find("p:nvSpPr/p:nvPr/p:ph", NS)
+                        if ph is not None:
+                            _idx, ph_type = _ph_key(ph)
+                            types.append(ph_type)
+                            kind = _signature_kind(ph_type)
+                            if kind not in signature:
+                                signature.append(kind)
+                        for unit in _shape_text_units(shape):
+                            detail["text_units"].append(unit)
+                    elif local == "pic":
+                        # picture placeholders may also carry real text in unusual decks
+                        for unit in _shape_text_units(shape):
+                            detail["text_units"].append(unit)
+                    elif local == "graphicFrame":
+                        tables, cell_units = _slide_table_records_from_frame(shape)
+                        for table in tables:
+                            detail["tables"].append(dict(table, index=len(detail["tables"]) + 1))
+                        table_index = len(detail["tables"])
+                        for unit in cell_units:
+                            unit["table"] = table_index
+                            detail["text_units"].append(unit)
                 title = None
                 for sp, ph, _cnv in _placeholder_shapes(root):
-                    if _ph_key(ph)[1] in ("title", "ctrTitle"):
-                        texts = [t.text or "" for t in sp.iter("{%s}t" % A)]
-                        title = "".join(texts).strip()
+                    if _ph_key(ph)[1] in _TITLE_PH_TYPES:
+                        title = "".join((node.text or "") for node in sp.iter("{%s}t" % A)).strip()
                         if title:
                             break
-                spec["slide_titles"].append({"part": part, "title": title})
+                detail["title"] = title or None
+                slide_titles_entry["title"] = title or None
+                detail["placeholder_signature"] = signature
+                detail["placeholder_types"] = types
+                raw_target, layout_part = _slide_layout_probe(zf, part)
+                detail["layout_probe"] = raw_target
+                detail["layout"] = layout_part
+                if layout_part and layout_part in names:
+                    if layout_part not in layout_name_cache:
+                        layout_root = common.load_zip_xml(zf, layout_part)
+                        c_sld_layout = _child(layout_root, "p:cSld") if layout_root is not None else None
+                        layout_name_cache[layout_part] = _attr(c_sld_layout, "name")
+                    detail["layout_name"] = layout_name_cache[layout_part]
+                elif layout_part:
+                    spec["notes"].append("slide %d points at a layout part missing from the package: %s"
+                                         % (index, layout_part))
+                detail["pictures"] = _slide_picture_records(zf, root, part)
+                detail["notes"] = _slide_notes_text(zf, part, notes_cache)
+                spec["slide_titles"].append(slide_titles_entry)
+                spec["slide_details"].append(detail)
+            spec["slides"] = len(slide_parts)
+            spec["slide_count"] = len(slide_parts)
+            spec["has_pictures"] = any(item["pictures"] for item in spec["slide_details"])
+            spec["has_tables"] = any(item["tables"] for item in spec["slide_details"])
+            spec["notes_count"] = sum(1 for item in spec["slide_details"] if item.get("notes"))
             spec["ok"] = spec["slides"] > 0
-    except (zipfile.BadZipFile, OSError, ET.ParseError, DiscoveryError) as exc:
+    except (zipfile.BadZipFile, zipfile.LargeZipFile, OSError, ET.ParseError, DiscoveryError) as exc:
         spec["notes"].append("start deck could not be inspected: %s: %s" % (type(exc).__name__, exc))
     return spec
 
@@ -703,6 +954,148 @@ def _classify_block(block, in_abstract):
     if in_abstract:
         return "abstract"
     return "text"
+
+
+# --------------------------------------------------------------------------------------
+# v1.3: real table cell data (ADDENDUM §A6 table requirement; never invented)
+# --------------------------------------------------------------------------------------
+
+_MD_TABLE_SEP_RE = re.compile(r"^\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?$")
+W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+
+def _split_md_table_row(line):
+    text = line.strip()
+    if text.startswith("|"):
+        text = text[1:]
+    if text.endswith("|"):
+        text = text[:-1]
+    return [cell.strip() for cell in text.split("|")]
+
+
+def extract_markdown_tables(lines, section_of_line):
+    """Every real markdown pipe table: header + body rows, with its source line."""
+    tables = []
+    index = 0
+    while index < len(lines) - 1:
+        current = lines[index].strip()
+        following = lines[index + 1].strip()
+        if current.startswith("|") and following.startswith("|") and _MD_TABLE_SEP_RE.match(following):
+            header = _split_md_table_row(current)
+            rows = []
+            cursor = index + 2
+            while cursor < len(lines) and lines[cursor].strip().startswith("|"):
+                rows.append(_split_md_table_row(lines[cursor]))
+                cursor += 1
+            section = section_of_line[index] if index < len(section_of_line) else None
+            tables.append({
+                "kind": "markdown pipe table",
+                "line": index + 1,
+                "section": section["id"] if section else None,
+                "section_title": section["title"] if section else None,
+                "header": header, "rows": rows,
+            })
+            index = cursor
+            continue
+        index += 1
+    return tables
+
+
+def _docx_table_records(root):
+    """Every real ``w:tbl`` in document order: first row as header, remaining rows as data."""
+    out = []
+    body = root.find("{%s}body" % W_NS)
+    scope = body if body is not None else root
+    for order, element in enumerate(
+            [el for el in scope.iter() if common.localname(el.tag) == "tbl"], 1):
+        rows = []
+        for row in element.findall("{%s}tr" % W_NS):
+            cells = [_docx_paragraph_text(cell).strip() for cell in row.findall("{%s}tc" % W_NS)]
+            if cells:
+                rows.append(cells)
+        if not rows:
+            continue
+        out.append({"kind": "docx w:tbl", "order": order,
+                    "header": rows[0], "rows": rows[1:]})
+    return out
+
+
+def _table_locator_line(entry):
+    match = re.search(r"line (\d+)", entry.get("locator") or "")
+    return int(match.group(1)) if match else None
+
+
+def _assign_table_cells(entry, table, link):
+    entry["header"] = list(table.get("header") or [])
+    entry["rows"] = [list(row) for row in (table.get("rows") or [])]
+    entry["data_source"] = table.get("kind")
+    entry["data_link"] = link
+    entry["data_locator"] = ("line %d" % table["line"]) if table.get("line") else None
+    widths = [len(entry["header"])] + [len(row) for row in entry["rows"]]
+    cols = max(widths) if widths else 0
+    entry["shape"] = {"header_rows": 1 if entry["header"] else 0,
+                      "data_rows": len(entry["rows"]), "cols": cols}
+
+
+def _attach_table_data(table_entries, parsed_tables):
+    """Link real parsed cells to ``tables[]`` entries; never invent a row.
+
+    Priority: a section heading that names the table (e.g. ``## 表1 消融实验汇总``) →
+    nearest table in the caption's own section → document order when counts match 1:1.
+    Anything unlinked keeps ``header=[]``/``rows=[]`` plus a ``data_note`` reason.
+    """
+    for entry in table_entries:
+        entry.setdefault("header", [])
+        entry.setdefault("rows", [])
+        entry.setdefault("data_source", None)
+        entry.setdefault("data_note", None)
+    if not table_entries:
+        return
+    if not parsed_tables:
+        for entry in table_entries:
+            if not entry.get("data_note"):
+                entry["data_note"] = ("no markdown/docx table with real cells was found in this "
+                                      "source; header/rows stay empty")
+        return
+    assigned = set()
+    for entry in table_entries:  # pass 1: section heading names this table
+        label_plain = entry["label"].replace(" ", "")
+        for index, table in enumerate(parsed_tables):
+            if index in assigned:
+                continue
+            title = (table.get("section_title") or "").replace(" ", "")
+            if label_plain and label_plain in title:
+                _assign_table_cells(entry, table, "section heading names this table: %r" % table.get("section_title"))
+                assigned.add(index)
+                break
+    for entry in table_entries:  # pass 2: nearest table in the same section
+        if entry.get("data_source"):
+            continue
+        line = _table_locator_line(entry)
+        candidates = []
+        for index, table in enumerate(parsed_tables):
+            if index in assigned or not table.get("line"):
+                continue
+            if table.get("section") != entry.get("section"):
+                continue
+            distance = abs((table["line"] or 0) - (line if line is not None else table["line"]))
+            candidates.append((distance, index))
+        if candidates:
+            distance, index = min(candidates)
+            _assign_table_cells(entry, parsed_tables[index],
+                                "nearest table in the same section (line distance %d)" % distance)
+            assigned.add(index)
+    free = [index for index in range(len(parsed_tables)) if index not in assigned]
+    unassigned = [entry for entry in table_entries if not entry.get("data_source")]
+    if unassigned and len(parsed_tables) == len(table_entries) and len(free) == len(unassigned):
+        for entry, index in zip(unassigned, free):  # pass 3: one caption per table, document order
+            _assign_table_cells(entry, parsed_tables[index],
+                                "assigned in document order (one real table per caption)")
+            assigned.add(index)
+    for entry in table_entries:  # honest reason when nothing could be linked
+        if not entry.get("data_source") and not entry.get("data_note"):
+            entry["data_note"] = ("%d real table(s) exist in this source but no unambiguous link to %s "
+                                  "was found; header/rows stay empty" % (len(parsed_tables), entry["label"]))
 
 
 def parse_markdown(text, rel):
@@ -764,7 +1157,15 @@ def parse_markdown(text, rel):
         block = "\n".join(buffer_lines).strip()
         if block:
             kind = "abstract" if in_abstract(buffer_section) else "text"
-            units.append(new_unit(kind, block, buffer_start + 1, buffer_section))
+            record = new_unit(kind, block, buffer_start + 1, buffer_section)
+            if (len(buffer_lines) >= 2
+                    and all(line.strip().startswith("|") for line in buffer_lines)
+                    and any(_MD_TABLE_SEP_RE.match(line.strip()) for line in buffer_lines)):
+                # real markdown pipe table: cell data lives in tables[]; flag the text unit so
+                # a planner does not also render the raw pipe rows as bullets.
+                record["in_table"] = True
+                record["table_data_source"] = "markdown pipe table starting at line %d" % (buffer_start + 1)
+            units.append(record)
             collect_captions(block, buffer_start + 1, buffer_section)
         buffer_lines = []
         buffer_start = None
@@ -804,6 +1205,8 @@ def parse_markdown(text, rel):
         buffer_lines.append(stripped)
         number += 1
     flush()
+    parsed_tables = extract_markdown_tables(lines, section_of_line)
+    _attach_table_data(tables, parsed_tables)
     return sections, units, figures, tables
 
 
@@ -873,107 +1276,394 @@ def parse_docx(path, rel):
                            entry["caption"], locator, current["id"] if current else None, uid)
             units.append(record)
             _record_caption(entry, record, locator, locator, figures, tables)
+    _attach_table_data(tables, _docx_table_records(root))
     return sections, units, figures, tables, {
         "tool": "docx-xml", "status": "ok", "detail": "%d paragraphs with text" % len(units),
     }
 
 
-def _detect_pdf_tool():
+PDF_TEXT_CLI_NAMES = ("pdf-text-tool", "pdftext", "ds-pdf-text")
+PDF_TEXT_ENV_VAR = "PDF_TEXT_TOOL"
+PDF_PY_MODULES = ("pypdf", "PyPDF2", "pdfplumber", "fitz")
+
+PDF_TEXT_DETAIL = ("no PDF text extractor succeeded; source_inventory.units stays empty and no "
+                   "body text is invented")
+
+
+def _pdf_tool_chain():
+    """Ordered list of ``(tool, path)`` candidates available on this machine (A6 order)."""
+    chain = []
     exe = shutil.which("pdftotext")
     if exe:
-        return ("pdftotext", exe)
-    try:  # optional, never required: pure-stdlib environments fall through honestly
-        import pypdf  # type: ignore  # noqa: F401
-        return ("pypdf", None)
-    except Exception:
-        pass
+        chain.append(("pdftotext", exe))
+    mutool = shutil.which("mutool")
+    if mutool:
+        chain.append(("mutool", mutool))
+    for module in PDF_PY_MODULES:
+        try:
+            __import__(module)
+        except Exception:
+            continue
+        chain.append((module, None))
+    env_tool = os.environ.get(PDF_TEXT_ENV_VAR)
+    if env_tool:
+        chain.append(("$" + PDF_TEXT_ENV_VAR, env_tool))
+    for name in PDF_TEXT_CLI_NAMES:
+        exe = shutil.which(name)
+        if exe:
+            chain.append((name, exe))
+    return chain
+
+
+def _detect_pdf_tool():
+    """First usable candidate in the A6 chain; ``(None, None)`` when nothing is available."""
+    chain = _pdf_tool_chain()
+    return chain[0] if chain else (None, None)
+
+
+def _pdf_attempt(attempts, tool, status, detail):
+    """Record one real attempt; ``status ∈ {ok, failed, unavailable}`` (never invented)."""
+    attempts.append({"tool": tool, "status": status, "detail": detail})
+
+
+def _clean_tool_stderr(text):
+    """Last real stderr line with the local home directory masked (no author paths leak)."""
+    text = text or ""
+    home = os.path.expanduser("~")
+    if home:
+        text = text.replace(home, "~")
+        text = text.replace(home.replace("\\", "/"), "~")
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return lines[-1][:300] if lines else ""
+
+
+def _run_pdf_command(argv, timeout=120):
+    """Run one external extractor; returns ``(text|None, detail)`` without raising."""
     try:
-        import PyPDF2  # type: ignore  # noqa: F401
-        return ("PyPDF2", None)
-    except Exception:
-        pass
-    return (None, None)
+        proc = subprocess.run(argv, capture_output=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, "%s: %s" % (type(exc).__name__, exc)
+    if proc.returncode != 0:
+        stderr = _clean_tool_stderr(proc.stderr.decode("utf-8", "replace"))
+        return None, "exit %d%s" % (proc.returncode, (": " + stderr) if stderr else "")
+    # a zero exit means the text stream is the payload; stderr here is tool logging noise
+    return proc.stdout.decode("utf-8", "replace"), ""
+
+
+def _extract_pdf_with_module(module, path):
+    """Text of a PDF through one real python library; raises nothing unexpected to callers."""
+    if module in ("pypdf", "PyPDF2"):
+        lib = __import__(module)
+        reader = lib.PdfReader(path)
+        pages = [(page.extract_text() or "") for page in reader.pages]
+        return "\f".join(pages), "%d pages" % len(pages)
+    if module == "pdfplumber":
+        import pdfplumber  # type: ignore
+        with pdfplumber.open(path) as pdf:
+            pages = [(page.extract_text() or "") for page in pdf.pages]
+        return "\f".join(pages), "%d pages" % len(pages)
+    if module == "fitz":
+        import fitz  # type: ignore
+        doc = fitz.open(path)
+        pages = [(page.get_text() or "") for page in doc]
+        doc.close()
+        return "\f".join(pages), "%d pages" % len(pages)
+    raise ValueError("unknown module %r" % module)
 
 
 def extract_pdf(path, rel):
-    tool, exe = _detect_pdf_tool()
-    if tool is None:
-        return None, {
-            "tool": "none", "status": "failed",
-            "detail": "no PDF text extractor available (pdftotext/pypdf/PyPDF2 all missing)",
-        }
-    if tool == "pdftotext":
+    """Probe the A6 extractor chain, recording **every** attempt in ``extraction.attempts``.
+
+    Returns ``(text, extraction)``; ``text`` is ``None`` only when every candidate failed,
+    in which case ``status=failed`` and no body text is fabricated by the caller.
+    """
+    attempts = []
+
+    def succeed(tool, text, detail):
+        _pdf_attempt(attempts, tool, "ok", detail or "text extracted")
+        return text, {"tool": tool, "status": "ok", "detail": detail or "text extracted",
+                      "attempts": attempts}
+
+    def failed(tool, detail):
+        _pdf_attempt(attempts, tool, "failed", detail)
+        return False
+
+    def unavailable(tool, detail):
+        _pdf_attempt(attempts, tool, "unavailable", detail)
+
+    # 1) pdftotext -layout FIRST: it preserves the blank paragraph lines that let a real PDF
+    #    become several source units (a plain pdftotext run flattens a page into one block).
+    pdftotext = shutil.which("pdftotext")
+    if not pdftotext:
+        unavailable("pdftotext", "not found on PATH")
+    else:
+        text, detail = _run_pdf_command([pdftotext, "-layout", path, "-"])
+        if text is not None and text.strip():
+            return succeed("pdftotext -layout", text, detail or "layout-preserving text stream")
+        failed("pdftotext -layout", detail or "produced no text")
+        text, detail = _run_pdf_command([pdftotext, path, "-"])
+        if text is not None and text.strip():
+            return succeed("pdftotext", text, detail or "plain text stream")
+        failed("pdftotext", detail or "produced no text")
+    mutool = shutil.which("mutool")
+    if not mutool:
+        unavailable("mutool", "not found on PATH")
+    else:
+        text, detail = _run_pdf_command([mutool, "draw", "-F", "txt", "-o", "-", path])
+        if text is not None and text.strip():
+            return succeed("mutool draw -F txt", text, detail or "mutool text device")
+        failed("mutool draw -F txt", detail or "produced no text")
+    if pdftotext:
+        # legacy OEM code-page variant declared by the task statement (CJK/dos encodings)
+        text, detail = _run_pdf_command([pdftotext, "-layout", "-enc", "OEM", path, "-"])
+        if text is not None and text.strip():
+            return succeed("pdftotext -layout -enc OEM", text, detail or "OEM-encoded text stream")
+        failed("pdftotext -layout -enc OEM", detail or "produced no text")
+
+    # 3) python libraries (probe order fixed by A6; each one is genuinely attempted)
+    for module in PDF_PY_MODULES:
         try:
-            proc = subprocess.run([exe, "-layout", path, "-"], capture_output=True, timeout=120)
-        except (OSError, subprocess.SubprocessError) as exc:
-            return None, {"tool": "pdftotext", "status": "failed",
-                          "detail": "%s: %s" % (type(exc).__name__, exc)}
-        if proc.returncode != 0:
-            return None, {"tool": "pdftotext", "status": "failed",
-                          "detail": "pdftotext exit %d: %s" % (proc.returncode, proc.stderr[:300].decode("utf-8", "replace"))}
-        return proc.stdout.decode("utf-8", "replace"), {
-            "tool": "pdftotext", "status": "ok", "detail": "pdftotext -layout",
-        }
-    try:
-        if tool == "pypdf":
-            import pypdf
-            reader = pypdf.PdfReader(path)
-            pages = [(page.extract_text() or "") for page in reader.pages]
+            __import__(module)
+        except Exception as exc:
+            unavailable(module, "import failed: %s: %s" % (type(exc).__name__, exc))
+            continue
+        try:
+            text, detail = _extract_pdf_with_module(module, path)
+        except Exception as exc:
+            failed(module, "%s: %s" % (type(exc).__name__, exc))
+            continue
+        if text and text.strip():
+            return succeed(module, text, detail)
+        failed(module, detail or "extractor returned no text")
+
+    # 4) the task-declared CLI tools (env var first, then the documented PATH names)
+    cli_candidates = []
+    env_tool = os.environ.get(PDF_TEXT_ENV_VAR)
+    if env_tool:
+        cli_candidates.append(("$" + PDF_TEXT_ENV_VAR, env_tool))
+    for name in PDF_TEXT_CLI_NAMES:
+        exe = shutil.which(name)
+        if exe:
+            cli_candidates.append((name, exe))
+    if not cli_candidates:
+        for name in PDF_TEXT_CLI_NAMES:
+            unavailable(name, "not found on PATH and %s is unset" % PDF_TEXT_ENV_VAR)
+    for label, exe in cli_candidates:
+        text, detail = _run_pdf_command([exe, path])
+        if text is not None and text.strip():
+            return succeed(label, text, detail or "external pdf text tool")
+        failed(label, detail or "produced no text")
+
+    return None, {
+        "tool": "none", "status": "failed",
+        "detail": "%s (%d attempts recorded)" % (PDF_TEXT_DETAIL, len(attempts)),
+        "attempts": attempts,
+    }
+
+
+PDF_UNIT_TARGET_CHARS = 300
+_PDF_END_PUNCT = "。．.，,；;：:"
+_PDF_TITLE_MAX_CHARS = 40
+_PDF_HEADING_MAX_CHARS = 60
+# Real PDF headings carry no markdown '#': 一、/（一）/1./1.1/1)/第X章 + ALL-CAPS short lines.
+_PDF_HEADING_RE = re.compile(
+    r"^(?:"
+    r"第?\s*[一二三四五六七八九十百]+\s*[、.．)）]"          # 一、 二. 三)
+    r"|第\s*[一二三四五六七八九十百\d]+\s*[章节部分]"        # 第一章 / 第 2 部分
+    r"|[（(]\s*[一二三四五六七八九十\d]+\s*[）)]"            # （一） (2)
+    r"|\d{1,2}(?:\.\d{1,2}){0,3}\s*[、.．)）]"               # 1. 1.1. 2)
+    r"|\d{1,2}(?:\.\d{1,2})+\s+\S"                           # 1.1 方法
+    r"|[A-Z][A-Z0-9 \-_/&.,]{2,60}$"                          # RESULTS / METHOD A
+    r")"
+)
+_PDF_SENTENCE_BREAK_RE = re.compile(r"(?<=[。！？!?])\s*|(?<=\.)\s+(?=[A-Z0-9(])")
+
+
+def _pdf_normalise_page(text):
+    return (text or "").replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _pdf_page_blocks(lines):
+    """``[(start_line_index, [lines])]`` — blank lines separate real paragraphs."""
+    blocks = []
+    index = 0
+    while index < len(lines):
+        if not lines[index].strip():
+            index += 1
+            continue
+        start = index
+        chunk = []
+        while index < len(lines) and lines[index].strip():
+            chunk.append(lines[index].rstrip())
+            index += 1
+        blocks.append((start, chunk))
+    return blocks
+
+
+def _pdf_is_heading(text):
+    text = (text or "").strip()
+    if not text or len(text) > _PDF_HEADING_MAX_CHARS:
+        return False
+    return bool(_PDF_HEADING_RE.match(text))
+
+
+def _pdf_title_candidate(text, next_text):
+    """First PDF line as the document title: short, no final punctuation, next line longer."""
+    text = (text or "").strip()
+    if not text or len(text) > _PDF_TITLE_MAX_CHARS:
+        return False
+    if text[-1] in _PDF_END_PUNCT:
+        return False
+    return len((next_text or "").strip()) > len(text)
+
+
+def _pdf_block_segments(start, chunk):
+    """Split one paragraph block into ``(line_number, text, single_line)`` segments.
+
+    A multi-line block whose first line is a real heading becomes a heading segment plus a
+    remainder paragraph, so the heading text is never swallowed into body prose.
+    """
+    joined = " ".join(part.strip() for part in chunk).strip()
+    if not joined:
+        return []
+    if len(chunk) > 1 and _pdf_is_heading(chunk[0].strip()):
+        segments = [(start + 1, chunk[0].strip(), True)]
+        rest = " ".join(part.strip() for part in chunk[1:]).strip()
+        if rest:
+            segments.append((start + 2, rest, False))
+        return segments
+    return [(start + 1, joined, len(chunk) == 1)]
+
+
+def _split_long_pdf_text(text, limit=PDF_UNIT_TARGET_CHARS):
+    """Split a long real paragraph on sentence boundaries (hard split only as a last resort)."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    if len(text) <= limit:
+        return [text]
+    parts = [part.strip() for part in _PDF_SENTENCE_BREAK_RE.split(text) if part and part.strip()]
+    chunks, buffer = [], ""
+    for part in parts:
+        if len(part) > limit:
+            if buffer:
+                chunks.append(buffer)
+                buffer = ""
+            while len(part) > limit:
+                chunks.append(part[:limit])
+                part = part[limit:]
+            buffer = part
+            continue
+        if not buffer:
+            buffer = part
+        elif len(buffer) + len(part) <= limit:
+            separator = " " if (buffer[-1].isascii() and part[0].isascii()) else ""
+            buffer += separator + part
         else:
-            import PyPDF2
-            reader = PyPDF2.PdfReader(path)
-            pages = [(page.extract_text() or "") for page in reader.pages]
-    except Exception as exc:
-        return None, {"tool": tool, "status": "failed", "detail": "%s: %s" % (type(exc).__name__, exc)}
-    return "\f".join(pages), {"tool": tool, "status": "ok", "detail": "%d pages" % len(pages)}
+            chunks.append(buffer)
+            buffer = part
+    if buffer:
+        chunks.append(buffer)
+    return [chunk.strip() for chunk in chunks if chunk.strip()]
 
 
 def parse_pdf(text, rel):
-    """Page-aware blocks; locator ``p.N``."""
+    """Page-aware PDF extraction: paragraphs, then line-level fallback, then real headings.
+
+    ``pdftotext -layout`` preserves paragraph blank lines, so a normal PDF yields one unit
+    per paragraph.  When a PDF has no blank lines at all, the whole document falls back to
+    one unit per real non-empty line (never a single invented block).  Headings/title are
+    recognised from the text itself (no markdown); over-long paragraphs are split on real
+    sentence boundaries.  Locators stay ``p.N line M`` and only extracted characters are
+    ever emitted.
+    """
+    pages = [_pdf_normalise_page(page) for page in (text or "").split("\f")]
+    page_blocks = []
+    nonempty_lines = 0
+    for page_number, page in enumerate(pages, 1):
+        lines = page.split("\n")
+        nonempty_lines += sum(1 for line in lines if line.strip())
+        for start, chunk in _pdf_page_blocks(lines):
+            page_blocks.append((page_number, start, chunk))
+    if len(page_blocks) < 3 and nonempty_lines >= 5:
+        # no paragraph blank lines in this PDF: fall back to one block per real line
+        line_blocks = []
+        for page_number, page in enumerate(pages, 1):
+            for index, line in enumerate(page.split("\n")):
+                if line.strip():
+                    line_blocks.append((page_number, index, [line]))
+        page_blocks = line_blocks
+
+    segments = []
+    for page_number, start, chunk in page_blocks:
+        for line_number, segment_text, single_line in _pdf_block_segments(start, chunk):
+            segments.append((page_number, line_number, segment_text, single_line))
+
     sections, units, figures, tables = [], [], [], []
     ordinal = 0
     uid = 0
     current = None
-    for page_number, page in enumerate((text or "").split("\f"), 1):
-        lines = page.split("\n")
-        number = 0
-        while number < len(lines):
-            if not lines[number].strip():
-                number += 1
-                continue
-            start = number
-            block_lines = []
-            while number < len(lines) and lines[number].strip():
-                block_lines.append(lines[number].rstrip())
-                number += 1
-            block = " ".join(part.strip() for part in block_lines).strip()
-            locator = "p.%d line %d" % (page_number, start + 1)
-            heading = _HEADING_RE.match(block)
-            if heading:
-                ordinal += 1
-                current = {"id": "S%d" % ordinal, "level": len(heading.group(1)),
-                           "title": heading.group(2).strip(), "ordinal": ordinal}
-                sections.append(current)
-            if heading:
-                uid += 1
-                units.append(_unit("u%04d" % uid, "heading", block, locator, current["id"] if current else None, uid))
-                continue
-            in_abstract = bool(current and re.search(r"摘要|abstract", current["title"], re.IGNORECASE))
-            kind = _classify_block(block, in_abstract)
+    first_segment = True
+    for position, (page_number, line_number, block, single_line) in enumerate(segments):
+        locator = "p.%d line %d" % (page_number, line_number)
+        next_text = segments[position + 1][2] if position + 1 < len(segments) else ""
+        is_first = first_segment
+        first_segment = False
+        markdown_heading = _HEADING_RE.match(block)
+        if markdown_heading:
+            ordinal += 1
+            current = {"id": "S%d" % ordinal, "level": len(markdown_heading.group(1)),
+                       "title": markdown_heading.group(2).strip(), "ordinal": ordinal}
+            sections.append(current)
             uid += 1
-            units.append(_unit("u%04d" % uid, kind, block, locator, current["id"] if current else None, uid))
-            for entry in extract_caption_entries(block):
-                # the block was flattened to one line, so offsets map back to the same page line
-                line_number = start + 1 + block[: entry["offset"]].count("\n")
-                caption_locator = "p.%d line %d" % (page_number, line_number)
-                uid += 1
-                record = _unit("u%04d" % uid,
-                               "figure_caption" if entry["kind"] == "figure" else "table_caption",
-                               entry["caption"], caption_locator,
-                               current["id"] if current else None, uid)
-                units.append(record)
-                _record_caption(entry, record, caption_locator,
-                                "%s#%s" % (rel, caption_locator), figures, tables)
+            units.append(_unit("u%04d" % uid, "heading", block, locator, current["id"], uid))
+            continue
+        if is_first and _pdf_title_candidate(block, next_text):
+            ordinal += 1
+            current = {"id": "S%d" % ordinal, "level": 1, "title": block, "ordinal": ordinal,
+                       "title_source": "first PDF line (<=40 chars, no final punctuation, next line longer)"}
+            sections.append(current)
+            uid += 1
+            record = _unit("u%04d" % uid, "heading", block, locator, current["id"], uid)
+            record["is_title"] = True
+            units.append(record)
+            continue
+        if single_line and _pdf_is_heading(block):
+            ordinal += 1
+            current = {"id": "S%d" % ordinal, "level": 1, "title": block, "ordinal": ordinal,
+                       "title_source": "PDF line matches a heading pattern (一、/1./1.1/（一）/ALL CAPS)"}
+            sections.append(current)
+            uid += 1
+            units.append(_unit("u%04d" % uid, "heading", block, locator, current["id"], uid))
+            continue
+        in_abstract = bool(current and re.search(r"摘要|abstract", current["title"], re.IGNORECASE))
+        kind = _classify_block(block, in_abstract)
+        for piece in _split_long_pdf_text(block):
+            uid += 1
+            units.append(_unit("u%04d" % uid, kind, piece, locator,
+                               current["id"] if current else None, uid))
+        for entry in extract_caption_entries(block):
+            uid += 1
+            record = _unit("u%04d" % uid,
+                           "figure_caption" if entry["kind"] == "figure" else "table_caption",
+                           entry["caption"], locator, current["id"] if current else None, uid)
+            units.append(record)
+            _record_caption(entry, record, locator, "%s#%s" % (rel, locator), figures, tables)
+
+    if sections:
+        # text before the first detected heading/title belongs to the first real section
+        first_id = sections[0]["id"]
+        for unit in units:
+            if unit.get("section") is None:
+                unit["section"] = first_id
+    elif units:
+        # no explicit title/heading line: keep the real text renderable without inventing one
+        sections.append({"id": "S1", "level": 1, "title": "", "ordinal": 1,
+                         "title_source": "no explicit heading/title line detected in the PDF"})
+        for unit in units:
+            if unit.get("section") is None:
+                unit["section"] = "S1"
+    _attach_table_data(tables, [])
     return sections, units, figures, tables
 
 
@@ -1278,7 +1968,13 @@ def review_packet(case_id, manifest, template_spec, inventory, catalog_count):
         lines.append("- %s → asset `%s` (%sx%s px) `%s`" % (
             figure["label"], figure.get("asset"), figure.get("width"), figure.get("height"), figure.get("source_ref")))
     for table in inventory.get("tables") or []:
-        lines.append("- %s → `%s`" % (table["label"], _clip(table.get("caption"), 90)))
+        shape = table.get("shape") or {}
+        cells = (" [%dx%d real cells from %s]" % (
+            shape.get("data_rows") or 0,
+            shape.get("cols") or 0,
+            table.get("data_source"))
+            ) if table.get("data_source") else " [no real cell data]"
+        lines.append("- %s → `%s`%s" % (table["label"], _clip(table.get("caption"), 90), cells))
     if not inventory.get("figures") and not inventory.get("tables"):
         lines.append("- none detected in the source text")
     lines.append("")
@@ -1318,11 +2014,13 @@ def review_packet(case_id, manifest, template_spec, inventory, catalog_count):
 def _toolchain():
     renderer = shutil.which("soffice") or shutil.which("libreoffice")
     pdf_tool, pdf_exe = _detect_pdf_tool()
+    chain = [tool for tool, _path in _pdf_tool_chain()]
     return {
         "python": "%d.%d.%d" % sys.version_info[:3],
         "renderer": renderer or "none",
         "pdf_text": pdf_tool or "none",
         "pdf_text_path": pdf_exe or "none",
+        "pdf_text_chain": chain,
     }
 
 
