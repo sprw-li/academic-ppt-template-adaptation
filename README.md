@@ -1,6 +1,6 @@
 # 学术 PPT 模板与格式适配 Skill
 
-把**固定论文/材料**套进**组织方提供的真实 pptx 模板**：识别真实的母版、版式、主题与占位符，写入正确的版式，保留图号与图表指向，等比缩放图表，守住可读字号下限，生成讲稿备注，并独立检查内容保真、格式继承和真实渲染。交付可编辑 `slides.pptx` + 页级证据映射 + 变更记录 + 真实 PDF/PNG 预览 + `result.json`。
+把**固定论文/材料**套进**组织方提供的真实 pptx 模板**：识别真实的母版、版式、主题与占位符，写入正确的版式，保留图号与图表指向，等比缩放图表，守住可读字号下限，生成讲稿备注，并独立检查内容保真、格式继承和真实渲染。题面要求"actual starting deck where edit/adapt requires one"与"fixed audience/time/slide count"时，本 Skill 会走 `mode=adapt_start_deck` 保留起始 deck 的**全部文本**（可重排/降号/拆页），逐项遵从 `case.json.constraints`，把计划里的表格渲染成真正可编辑的 `<a:tbl>`，并写出可朗读、有来源的讲稿。交付可编辑 `slides.pptx` + 页级证据映射 + 变更记录 + 真实 PDF/PNG 预览 + `result.json`。
 
 - 触发条件与执行硬规则见 [SKILL.md](SKILL.md)。
 - 从侦察证据编写计划的逐步方法见 [计划编写指南](references/plan_guide.md)。
@@ -66,6 +66,26 @@ python "$SKILL/scripts/run.py" all --input /input --work /app/work --output /app
 
 `all` 等价于 `prepare → 自动推导保守计划 → finish`；自动计划与手写计划走**完全相同**的保真/格式/渲染门禁。
 
+### 有起始 deck 时：走 `adapt_start_deck`
+
+题面要求"在已有 deck 上编辑/适配"时，**不要**照 `from_template` 从零重建——那样会丢掉起始 deck 的内容。流程一样，只是 `prepare` 会把模式写进计划：
+
+```bash
+python "$SKILL/scripts/run.py" prepare --input /input --work /app/work --output /app/output
+# 读 /app/work/start_deck_spec.json（v1.3）确认起始 deck 真实可解析：
+#   ok=true / slide_count>0 / slide_details[].text_units[] 与 pictures[]
+# 再读 /app/work/slides_plan.json，确认 mode=adapt_start_deck、start_deck_path 指向该 deck，
+# 并把每页的 source_slide / preserve_start_text=true 与 constraints_applied 补全。
+python "$SKILL/scripts/run.py" finish --work /app/work --output /app/output
+```
+
+- **触发条件**（三者同时成立）：`case_manifest.json` 的 `detected.start_deck` 唯一命中、`start_deck_spec.json.ok=true`、`slide_count>0`，且任务说明要求适配已有 deck。任一不成立就退回 `mode=from_template`（`start_deck_path=null`），并在 plan `notes` 说明为什么没用起始 deck。
+- **要覆盖自动判定**：只改 `/app/work/slides_plan.json` 里的 `mode` 与 `start_deck_path`，不要加命令行选项；证据冲突时把两条来源都写进 `notes` 与 `open_items.uncertainty`，审计侧 `start_deck_preserved` 记 `skipped`。
+- **内容规则**：起始 deck 每页文本必须保留（可重排/降号/拆页），起始 deck 里有而计划未列的页默认追加保留；确需删页必须记 `start_deck_slide_dropped` + 理由 + 该页文本 hash。
+- **约束规则**：`case.json.constraints` 的 `audience`/`time_minutes`/`target_slide_count`/`font_size_floor_pt`/`caption_numbering` 逐项落到计划与 deck，并在 `constraints_applied` 记 `{value, source}`；`target_slide_count` 是硬上限。
+- **表格规则**：计划 `tables[]` 渲染成真正的 `<a:tbl>`，不许截图或纯文本替代。
+- **讲稿规则**：每页 `notes` 写成可朗读句子，`notes_evidence` 非空且内容 token 可回溯到源。
+
 ### Windows 调用示例
 
 PowerShell（先设变量，避免写死本机路径）：
@@ -118,6 +138,19 @@ python "%SKILL%\scripts\run.py" finish  --work /app/work --output /app/output
 6. 核对真实预览：`render_report.status` 为 `rendered` 时，`preview/slides.pdf` 与 `preview/page-001.png…` **必须真实存在且非空**，页数与 pptx 页数一致（`consistency.ok=true`）；否则应为 `skipped`/`failed` 并写明原因，不得用其他文件冒充。
 7. 核对保真与变更：`fidelity_report.ok=true` 且 `violations[]` 无未解释项；`change_records.jsonl` 的每条改动都能对上 `adaptation_actions.json` 的 `before/after/evidence`。
 8. 最后跑一次合同自检：读 `/app/output/evidence/validation_report.json`，确认 `ok` 与未填字段，再看 `result.json.delivery.status` 是否与第 6 节的缺口描述一致。
+9. **（v1.3）核验起始 deck 内容没丢**：先看 `format_audit.checks[]` 里 `start_deck_preserved` 的状态与 `evidence[]`，再把 `start_deck_spec.json.slide_details[].text_units[].text` 逐条与 `/app/output/slides.pptx` 的正文对照；允许页序变化、字号变小、拆页（标题带 "(续)"），**不允许**整句/整段消失。确需删页的，`adaptation_actions.json` 必须有 `start_deck_slide_dropped` + 理由 + 该页文本 hash；计划外的起 deck 页应为 `start_deck_slide_preserved`。可用下面的命令把起始 deck 每页文本打印出来逐条核对：
+
+```bash
+python -c "import json,sys,io;d=json.load(io.open(sys.argv[1],encoding='utf-8'));[print(s['index'],s.get('title'),[u['text'] for u in s.get('text_units',[])]) for s in d['slide_details']]" /app/work/start_deck_spec.json
+```
+
+10. **（v1.3）核验表格是真 `<a:tbl>` 而不是图片/纯文本**：`format_audit.checks[]` 的 `table_rendered` 应为 `pass`（或计划确实无表格时 `skipped` 且进了 `unchecked`）；同时直接用下面命令数一遍输出 deck 里的 `<a:tbl>` 与 `<a:tblGrid>`，数量应等于 `slides_plan.json` 的 `tables[]` 条数（拆表时按拆出的块数计，并能在 `adaptation_actions.json` 找到 `table_split`）：
+
+```bash
+python -c "import re,sys,zipfile;z=zipfile.ZipFile(sys.argv[1]);parts=[n for n in z.namelist() if re.match(r'ppt/slides/slide[0-9]+\.xml$',n)];data={n:z.read(n).decode('utf-8') for n in parts};print('slide_parts=%d a_tbl=%d a_tblGrid=%d'%(len(parts),sum(v.count('<a:tbl>') for v in data.values()),sum(v.count('<a:tblGrid>') for v in data.values())))" /app/output/slides.pptx
+```
+
+11. **（v1.3）核验约束与讲稿**：`result.json.plan.constraints_applied` 五项与 `case.json.constraints` 对上（`audience`/`time_minutes` 不得是占位串，`slide_count <= target_slide_count`）；`format_audit` 的 `constraints_honoured` 为 `pass`；`fidelity_report.notes_evidence[]` 每页 `unsourced_tokens` 为空，且 `notes` 打开就在 deck 的备注页里（不是只写在计划里）。
 
 任何一项 `fail`/`skipped`/`unchecked` 都**不得**当成通过；发现不一致时回到 `/app/work` 的原始报告定位，而不是改文字结论。
 
@@ -146,6 +179,9 @@ python -c "import os,sys;r=sys.argv[1];fs=[os.path.join(d,f) for d,_,g in os.wal
 | 全部关键产物 + 保真 + 格式 + 真实预览 + 合同就绪 | 状态才可为 `ok` |
 | 有真实可用 deck，但渲染/字体/部分规格未验证 | `partial`，清楚列出缺口 |
 | 保真失败（`fidelity_report.ok=false`）、关键格式项 fail、审计模块缺失 | `needs_human`，exit `3`；仍保留已有中间产物与原件 |
+| v1.3 四项新检查任一项 `fail`（`start_deck_preserved` / `table_rendered` / `constraints_honoured` / `notes_evidence_present`） | 按**关键格式项 fail** 处理：`needs_human`，exit `3`；缺口与冲突写进 `open_items`，不要靠改文字修绿 |
+| v1.3 四项新检查只出现 `skipped`（无起始 deck / 无表格 / 案例无约束 / 案例不要求讲稿） | 降为 `partial`，exit `0`；`skipped` 项必须进 `format_audit.unchecked[]` 或该项 `detail`，**不是** `pass` |
+| 起始 deck 内容与源材料冲突 | 以源材料为事实基准；冲突原文与出处写进 `open_items.uncertainty`，起始 deck 文本仍按 `start_deck_preserved` 规则保留 |
 | 渲染器不可用（`render_report.status=skipped`）或渲染失败（`failed`） | `partial`，exit `0`；deck 可用，预览缺席并如实记录，**不**借用其他文件冒充预览 |
 | 请求正文改写、跨模板合并、在线下载模板、宏 deck 编辑 | 只读保留并登记 `unsupported`/不确定性；见 [限制与降级](references/limitations.md) |
 
