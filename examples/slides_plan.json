@@ -1,15 +1,23 @@
 {
   "plan_version": "1",
   "example": true,
-  "example_note": "EXAMPLE ONLY — synthetic slides_plan shape. Not an official case plan, not a prepared answer, not a run result and not a score. Layout names, unit ids, figure ids and contract paths below are invented to show the interface.",
+  "example_note": "EXAMPLE ONLY — synthetic slides_plan shape for the v1.3 additions (mode/start_deck_path/constraints_applied, slides[].source_slide/preserve_start_text, tables[], notes_evidence). Not an official case plan, not a prepared answer, not a run result and not a score. Layout names, unit ids, figure/table ids, texts, numbers and contract paths below are invented to show the interface only.",
   "source_path": "paper.md",
   "template_path": "template.pptx",
-  "start_deck": null,
+  "mode": "adapt_start_deck",
+  "start_deck_path": "start_deck.pptx",
   "deck_name": "slides.pptx",
   "language": "zh",
-  "audience": "EXAMPLE lab group meeting",
+  "audience": "EXAMPLE 课题组周会（仅示例文字）",
   "time_minutes": 15,
-  "target_slide_count": 3,
+  "target_slide_count": 4,
+  "constraints_applied": {
+    "audience": {"value": "EXAMPLE 课题组周会（仅示例文字）", "source": "case.json:constraints.audience"},
+    "time_minutes": {"value": 15, "source": "case.json:constraints.time_minutes"},
+    "target_slide_count": {"value": 4, "source": "case.json:constraints.target_slide_count"},
+    "font_size_floor_pt": {"value": {"body": 14, "caption": 12}, "source": "case.json:constraints.font_size_floor_pt"},
+    "caption_numbering": {"value": "preserve_source", "source": "case.json:constraints.caption_numbering"}
+  },
   "confirmed_roles": false,
   "slides": [
     {
@@ -19,12 +27,15 @@
       "layout_part": "ppt/slideLayouts/slideLayout1.xml",
       "title": "EXAMPLE 合成标题",
       "subtitle": "EXAMPLE 合成副标题",
+      "source_slide": 1,
+      "preserve_start_text": true,
       "bullets": [],
       "figures": [],
-      "notes": "EXAMPLE 开场讲稿：说明本页只是接口示例。",
-      "notes_evidence": ["u0001"],
-      "claims": ["EXAMPLE 页级主张：本示例仅演示字段形状。"],
-      "evidence": ["u0001"],
+      "tables": [],
+      "notes": "EXAMPLE 讲稿：这一页说明本次汇报要把起始 deck 的四页内容适配到模板版式上，先讲问题，再看方法和结果。",
+      "notes_evidence": ["S1", "u0001"],
+      "claims": ["EXAMPLE 页级主张：本示例仅演示 v1.3 字段形状。"],
+      "evidence": ["S1", "u0001"],
       "continuation_of": null
     },
     {
@@ -34,12 +45,15 @@
       "layout_part": "ppt/slideLayouts/slideLayout2.xml",
       "title": "EXAMPLE 方法",
       "subtitle": "",
+      "source_slide": 2,
+      "preserve_start_text": true,
       "bullets": [
         {"text": "EXAMPLE 方法要点一（仅示例文字）", "level": 0, "evidence": ["u0012"]},
         {"text": "EXAMPLE 方法要点二（仅示例文字）", "level": 1, "evidence": ["u0013"]}
       ],
       "figures": [],
-      "notes": "EXAMPLE 讲稿：方法页只引用源单元，不改写正文。",
+      "tables": [],
+      "notes": "EXAMPLE 讲稿：方法页只引用源单元，保留起始 deck 的原句，不为了版面改写事实。",
       "notes_evidence": ["u0012", "u0013"],
       "claims": ["EXAMPLE 页级主张：方法由两个源单元支撑。"],
       "evidence": ["u0012", "u0013"],
@@ -47,27 +61,51 @@
     },
     {
       "n": 3,
-      "role": "figure",
+      "role": "table",
       "layout_name": "EXAMPLE 标题和内容",
       "layout_part": "ppt/slideLayouts/slideLayout2.xml",
-      "title": "EXAMPLE 结果",
+      "title": "EXAMPLE 结果对比表",
       "subtitle": "",
+      "source_slide": 3,
+      "preserve_start_text": true,
       "bullets": [
-        {"text": "EXAMPLE 结果要点（仅示例文字）", "level": 0, "evidence": ["u0044"]}
+        {"text": "EXAMPLE 结果要点（仅示例文字），表格数据必须与源逐字一致。", "level": 0, "evidence": ["u0044"]}
       ],
-      "figures": [
+      "figures": [],
+      "tables": [
         {
-          "source": "F1",
-          "asset": "fig/fig1.png",
-          "caption": "图1 EXAMPLE 合成图注",
-          "cite": "u0044",
-          "aspect_lock": true
+          "source": "T1",
+          "caption": "表1 EXAMPLE 合成对比表",
+          "header": ["EXAMPLE 条件", "EXAMPLE 数值"],
+          "rows": [["EXAMPLE 甲", "0.0"], ["EXAMPLE 乙", "0.0"]],
+          "evidence": ["u0044"],
+          "caption_number": "表1"
         }
       ],
-      "notes": "EXAMPLE 讲稿：图号默认保留源编号，不重写。",
-      "notes_evidence": ["u0044"],
-      "claims": ["EXAMPLE 页级主张：结果由一个源单元和一张图支撑。"],
-      "evidence": ["u0044", "F1"],
+      "notes": "EXAMPLE 讲稿：这一页的表格来自源材料表1，交付时必须渲染成真正的可编辑表格，行列和单元格文字要和这里一致。",
+      "notes_evidence": ["T1", "u0044"],
+      "claims": ["EXAMPLE 页级主张：表1 的数据可以逐单元格回溯到源。"],
+      "evidence": ["u0044", "T1"],
+      "continuation_of": null
+    },
+    {
+      "n": 4,
+      "role": "conclusion",
+      "layout_name": "EXAMPLE 标题和内容",
+      "layout_part": "ppt/slideLayouts/slideLayout2.xml",
+      "title": "EXAMPLE 结论",
+      "subtitle": "",
+      "source_slide": 4,
+      "preserve_start_text": true,
+      "bullets": [
+        {"text": "EXAMPLE 结论要点（仅示例文字）", "level": 0, "evidence": ["u0050"]}
+      ],
+      "figures": [],
+      "tables": [],
+      "notes": "EXAMPLE 讲稿：最后回到起始 deck 的结论页，结论内容沿用源材料，不新增源里没有的判断。",
+      "notes_evidence": ["u0050"],
+      "claims": ["EXAMPLE 页级主张：结论只复述源材料的结论。"],
+      "evidence": ["u0050"],
       "continuation_of": null
     }
   ],
@@ -79,14 +117,18 @@
   },
   "numbering": {
     "mode": "preserve_source",
-    "map": ["F1=图1"]
+    "map": ["F1=图1", "T1=表1"]
   },
   "contract_values": {
     "delivery.artifacts": "delivery.artifacts"
   },
   "notes": [
+    "EXAMPLE: mode=adapt_start_deck and start_deck_path are shown because this example pretends a start deck exists; a real case must fill them only when detected.start_deck is unique, start_deck_spec.ok=true and slide_count>0, per plan_guide.md section 2.1.",
+    "EXAMPLE: constraints_applied echoes invented case.json.constraints values so the {value, source} shape is visible; real runs must copy the actual case.json.constraints values and never invent audience/time.",
+    "EXAMPLE: source_slide values 1-4 stand for a synthetic 4-slide start deck; preserve_start_text=true means those slides' text must survive re-layout, font downgrade or split. Real runs must read start_deck_spec.json.slide_details[].index and text_units.",
+    "EXAMPLE: tables[0] is a synthetic 2-column table sourced from T1; adapt_pptx must emit a real OOXML a:tbl with the same shape and cell text, never a screenshot or a plain-text fallback.",
     "EXAMPLE: confirmed_roles is false because this synthetic example has no real template or source evidence to confirm roles from.",
-    "EXAMPLE: layout_name/layout_part, unit ids (u0012/u0013/u0044), figure id F1 and the contract_values key are invented for shape only; a real case must use values read from its own template_spec.json / source_inventory.json / case.json.",
+    "EXAMPLE: layout_name/layout_part, unit ids (u0012/u0013/u0044/u0050), section S1, figure id F1, table id T1 and the contract_values key are invented for shape only.",
     "EXAMPLE: font_ladder stays at or above common.FONT_FLOOR (title 2400 / body 1400 / caption 1200 / table 1200 / notes 1000, 1/100 pt)."
   ]
 }
