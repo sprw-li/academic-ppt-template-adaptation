@@ -50,12 +50,37 @@
 | `delivery.audit` | `fidelity_ok` 来自 `fidelity_report.ok`；`format_status` 来自 `format_audit.status`；`render_status` 来自 `render_report.status`；`unfilled_fields` 见 §3。 |
 | `evidence` | 指向各审计报告的摘要/引用（`sources` / `change_records` / `fidelity` / `format_audit` / `render`）。 |
 | `slides[]` | 逐页映射：`n` / `role` / `title` / `claims[]` / `evidence[]{kind,ref,locator,cite}`。`locator` 是源材料中的真实定位（如 `p.3 §2.1`、`line 42`、`图1`）。 |
-| `plan` | `template`/`source` 相对路径、实际 `slide_count`、`layout_usage`（每个版式用了多少页）。 |
+| `plan` | `template`/`source` 相对路径、实际 `slide_count`、`layout_usage`（每个版式用了多少页）；**v1.3 增补** `mode`、`start_deck_path` 与 `constraints_applied`，见 §2.1。 |
 | `template_inheritance` | 真实继承链：`masters[]`、`layouts[]`、`theme`、逐页 `slide_layout_links[]`。**不得填写不存在的部件。** |
 | `open_items` | `uncertainty[]`（未能确认的事实）与 `limitations[]`（明确的能力/证据缺口）。 |
 | `runtime` | `prepare_s`/`finish_s` 实测秒数、`python` 版本、`renderer`、`budget`。 |
 | `output_contract` | 原输入的 `output_contract` **原样保留**（键、嵌套形状、值都不动）。 |
 | `contract_path_map` | 见 §3。 |
+
+### 2.1 v1.3 增量：`plan.constraints_applied` 与相关落点
+
+题面要求"fixed audience/time/slide count"，因此 `case.json.constraints` 必须逐项遵从并留痕。冻结落点是 **`result.json.plan.constraints_applied`**（与 `/app/output/slides_plan.json` 的同名字段同值）：
+
+```json
+"plan": {
+  "template": "template.pptx", "source": "paper.md",
+  "slide_count": 16, "layout_usage": {"标题和内容": 9, "空白": 2},
+  "mode": "adapt_start_deck",
+  "start_deck_path": "start_deck.pptx",
+  "constraints_applied": {
+    "audience": {"value": "…", "source": "case.json:constraints.audience"},
+    "time_minutes": {"value": 15, "source": "case.json:constraints.time_minutes"},
+    "target_slide_count": {"value": 16, "source": "case.json:constraints.target_slide_count"},
+    "font_size_floor_pt": {"value": {"body": 14, "caption": 12}, "source": "case.json:constraints.font_size_floor_pt"},
+    "caption_numbering": {"value": "preserve_source", "source": "case.json:constraints.caption_numbering"}
+  }
+}
+```
+
+- 这是**只增不改**的 v1.3 扩展：`template`/`source`/`slide_count`/`layout_usage` 语义不变，不新增未冻结的顶层键。
+- 每项必须是 `{value, source}`；`source` 用 `case.json:constraints.<key>` 形式指向真实约束，案例未提供的项写 `null` 并在 `open_items`/`notes` 说明**不要编造**。
+- `target_slide_count` 是硬上限：审计 `constraints_honoured` 会比较 `result.json.plan.slide_count <= target_slide_count`。
+- 计划的 `mode` 与 `start_deck_path` 也随 `plan` 暴露出来（`from_template` 时 `start_deck_path=null`），便于审计确认起始 deck 是否被真正使用。
 
 ## 3. 原合同保留、`contract_path_map` 与 `unfilled_fields`
 
@@ -108,6 +133,37 @@
 
 3. **禁止**用「文本以图号开头」这类文本模式判角色（实测误报来源）。
 
+### 4.2 `format_audit` 的 v1.3 四项新检查
+
+四项新检查与 v1.2 的检查**同一结构**（`{name, status, expected, observed, evidence[], detail}`）并入 `format_audit.checks[]`，并同样遵守 `skipped ≠ pass`：
+
+| `name` | 判据 | 何时 `skipped` | 失败含义 |
+|---|---|---|---|
+| `start_deck_preserved` | `mode=adapt_start_deck` 时，起始 deck 每页的每个文本单元都出现在输出 deck（含拆页），或该页在 `adaptation_actions.json` 有 `start_deck_slide_dropped` + 理由（及文本 hash） | `mode=from_template`（无起始 deck / 坏 zip / 任务要求新建） | 有起始 deck 的文本被静默丢弃＝丢事实，按关键格式项 fail |
+| `table_rendered` | 计划 `tables[]` 的每个表格都在输出 deck 里以真正的 `<a:tbl>` 出现，行列数与 `header`/`rows` 一致，单元格文本逐字一致 | 计划里没有任何 `tables[]`（无表可渲染） | 表格被降级成图片/纯文本＝交付能力缺失，关键格式项 fail |
+| `constraints_honoured` | `plan.slide_count <= target_slide_count`；`audience`/`time_minutes` 与 `case.json.constraints` 一致且非空（case 提供时）；字号下限来自 `font_size_floor_pt` | case 未提供任何可核对的 `constraints` 字段 | 约束被忽略（超页数、编造听众/时长、压到下限以下）＝关键格式项 fail |
+| `notes_evidence_present` | 每页 `notes_evidence` 非空，且 `notes` 的内容 token 能在其 evidence 指向的 `units[]/sections[]/figures[]/tables[]` 源文本中找到（允许虚词/连接词） | case 不要求讲稿且计划中确实无备注（须在 `detail` 写明） | 讲稿无来源或为空＝编造风险，关键格式项 fail |
+
+- 四项都要求 `evidence[]` 指向真实部件/字段（如 `ppt/slides/slide3.xml`、`result.json.plan.constraints_applied`、`slides_plan.json:slides[2].tables[0]`），**不接受**"看起来对"的文字结论。
+- 每项都要有**负例对照**：注入 `start_deck_text_dropped` / `table_flattened_to_text` / `constraint_ignored` / `notes_unsourced` 时必须检得 `fail`；未注入时必须 `pass`（或按上表 `skipped`）。
+- 四项的 `status` 会参与 `format_audit.status` 汇总：任一 `fail` → 关键格式项 fail（`needs_human`）；只有 `skipped` → `format_audit.status=partial`，且 `skipped` 的项要同时出现在 `format_audit.unchecked[]` 或该项 `detail`。
+
+### 4.3 `fidelity_report.notes_evidence` 的语义
+
+`fidelity_report` 不再只校验"讲稿不是空的"，而是给出**逐页讲稿 → 来源**的对照表，供 `notes_evidence_present` 与保真检查共用：
+
+```json
+"notes_evidence": [
+  {"slide": 3, "evidence": ["u0012", "S2"], "notes_sha256": "…",
+   "tokens_checked": 18, "unsourced_tokens": [], "status": "pass|fail|skipped"}
+]
+```
+
+- `slide`：页码，与 `result.json.slides[].n` 一致；`evidence`：该页 `notes_evidence` 的原值（顺序保留）。
+- `tokens_checked` / `unsourced_tokens`：实际比对过的内容 token 数与**找不到来源**的 token 列表；`unsourced_tokens` 非空即 `status=fail`，并把该页写进 `violations[]`。
+- `notes_sha256`：该页讲稿文本的实算哈希，用于证明审计对象是交付 deck 里的备注而不是计划自报。
+- 语义边界：允许虚词、连接词与"本页先讲…再看下一页"这类**结构性过渡语**；不允许出现源材料没有的数字、单位、结论、图号。`status=skipped` 只用于"该案例不要求讲稿且 deck 确实无备注"，且必须写 `detail`。
+
 ## 5. 哪些证据必须真实
 
 | 证据 | 真实性要求 |
@@ -119,6 +175,10 @@
 | **页级定位** | `result.json.slides[].evidence[].locator` 必须是源材料中的真实定位（页码/行号/图号/部件名）；索引 `ref` 必须能在 `source_inventory` 找到。 |
 | **变更记录** | `change_records.jsonl` 每条含 `ts`/`slide`/`kind`/`target`/`before`/`after`/`evidence`，且与 `adaptation_actions.json` 的逐项动作对得上。 |
 | **运行时长/工具链** | `runtime.prepare_s` / `finish_s` 与 `render_report.renderer` 是实测值；探测不到就写 `skipped`/`none`，不编版本号。 |
+| **起始 deck 保真（v1.3）** | `mode=adapt_start_deck` 时 `start_deck_spec.json.ok=true` 且 `slide_details[]` 来自真实字节；`start_deck_slide_dropped` 必须带理由与**该页文本的实算 hash**；不得用"计划里没列"当作删除理由。 |
+| **表格（v1.3）** | `<a:tbl>` 必须由 `ppt/slides/*.xml` 的真实 XML 解析出；行列数与单元格文本必须与计划 `tables[]` 逐字一致，且 `tables[].source` 能在 `source_inventory.tables[]` 找到；不得用图片或文本框冒充。 |
+| **约束（v1.3）** | `constraints_applied[].value` 必须与 `case.json.constraints` 实读值一致，`source` 指向真实路径；`audience`/`time_minutes` 不得编造，`target_slide_count` 不得超页。 |
+| **讲稿（v1.3）** | `notes` 文本取自交付 deck 的 `ppt/notesSlides/*.xml`（与 `notes_sha256` 一致）；`notes_evidence[]` 必须能在 `source_inventory` 找到对应 id；讲稿不得含源材料没有的数字或结论。 |
 
 ## 6. 输出前的最小自检
 
@@ -128,6 +188,9 @@
 4. `delivery.status` 与 §4 的判据一致（尤其：保真失败或关键格式项 fail 时不得为 `ok`；无渲染器时 `render_report.status=skipped`，状态应为 `partial` 而非 `needs_human`）。
 5. `open_items.uncertainty`/`limitations` 覆盖 `partial`/`needs_human` 的全部缺口。
 6. `/app/output/slides_plan.json`、`evidence/*` 与 `<work>` 中的报告内容一致（副本未过期）。
+7. （v1.3）`result.json.plan.mode` 与 `start_deck_path` 自洽：`adapt_start_deck` 时输出 deck 含起始 deck 的每一页文本（或在 `adaptation_actions.json` 有 `start_deck_slide_dropped` + 理由与 hash）；`from_template` 时 `start_deck_path=null`。
+8. （v1.3）`format_audit.checks[]` 含 `start_deck_preserved`/`table_rendered`/`constraints_honoured`/`notes_evidence_present` 四项，`skipped` 的都进了 `unchecked` 或 `detail`；`plan.tables[]` 非空时输出 deck 里确有对应 `<a:tbl>`。
+9. （v1.3）`result.json.plan.constraints_applied` 五项与 `case.json.constraints` 一致，`plan.slide_count <= target_slide_count`；`fidelity_report.notes_evidence[]` 每页 `unsourced_tokens` 为空（或已写进 `violations[]` 并降级）。
 
 ## 7. 相关文件
 
