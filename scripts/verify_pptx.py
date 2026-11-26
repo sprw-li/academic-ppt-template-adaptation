@@ -513,9 +513,20 @@ def _extract_deck(parts, spec):
                 notes_text = "\n".join(t.text or "" for t in nroot.iter(_qn(A, "t")))
             except ET.ParseError:
                 notes_text = ""
+        # editable tables: <p:graphicFrame><a:graphic><a:graphicData><a:tbl>
+        tables = []
+        for tbl in root.iter(_qn(A, "tbl")):
+            cells = []
+            for tr in tbl.findall(_qn(A, "tr")):
+                row = []
+                for tc in tr.findall(_qn(A, "tc")):
+                    row.append("\n".join(t.text or "" for t in tc.iter(_qn(A, "t"))))
+                cells.append(row)
+            tables.append({"cells": cells, "rows": len(cells),
+                           "cols": max([len(r) for r in cells] or [0])})
         slides.append({"part": sp_name, "n": len(slides) + 1, "layout": layout,
                        "notes_part": notes, "notes_text": notes_text,
-                       "shapes": shapes, "pics": pics, "root": root,
+                       "shapes": shapes, "pics": pics, "tables": tables, "root": root,
                        "slide_num_fld": any(True for f in root.iter(_qn(A, "fld"))
                                             if f.get("type") in ("slidenum",)),
                        "footer_fld": any(True for f in root.iter(_qn(A, "fld"))
@@ -621,15 +632,467 @@ def _check(name, status, expected, observed, detail="", evidence=None):
             "detail": detail, "evidence": evidence or []}
 
 
+# ======================================================================================
+# v1.3 capability audit helpers (ADDENDUM v1.3 §A5)
+#
+# The four new checks are judged only against the *real bytes* plus the frozen v1.3
+# intermediates.  Applicability is explicit: a check that does not apply to this run is
+# recorded with status ``not_applicable`` (never ``pass``); a check that should apply but
+# has no evidence is a ``fail`` -- silently skipping is exactly the failure mode v1.2
+# closed.
+# ======================================================================================
+
+V13_CHECKS = ("start_deck_preserved", "table_rendered", "constraints_honoured",
+              "notes_evidence_present")
+
+# per start-deck text unit: share of its content tokens that must survive onto the deck
+START_DECK_UNIT_RATIO = 0.8
+# speaker-notes content must be this well covered by the notes_evidence source texts.
+# ``notes`` is an authored script, not a quote: after removing the connector/stopword set
+# below, the remaining *content* tokens must be >= 90% present in the evidence texts and
+# every statistic must be present verbatim.
+NOTES_EVIDENCE_RATIO = 0.9
+# narration/connector vocabulary that carries no fact (ADDENDUM §A4 allows 虚词与连接词)
+_NOTES_STOP = _STOP | set(
+    "本 页 要 点 接 下 来 看 先 其 次 然 后 我 们 这 里 那 将 会 说 明 及 如 所 示 请 注 意 "
+    "问 题 一 二 三 四 五 六 七 八 九 十 第 个 部 分 内 容 讲 解 过 渡 张 幻 灯 片 页 面 "
+    "首 先 同 时 因 此 所 以 但 是 而 且 另 外 综 上 以 下 以 上 具 体 情 况 相 关 方 面 "
+    "then next now here this that thus also however therefore finally first second".split())
+
+
+def _plan_is_v13(plan):
+    """A v1.3 plan always declares ``mode``; v1.2 plans are not judged on v1.3 features."""
+    return (isinstance(plan, dict) and isinstance(plan.get("mode"), str)
+            and plan["mode"].strip() != "")
+
+
+def _load_json(work, name):
+    data = common.read_json(os.path.join(work, name))
+    return data if isinstance(data, dict) else {}
+
+
+def _read_case_json(work, manifest):
+    """Locate the real frozen ``case.json`` and return ``(case_dict, path)``."""
+    cands = []
+    for entry in (manifest.get("inputs") or []):
+        if not isinstance(entry, dict):
+            continue
+        rel = (entry.get("rel") or "").replace("\\", "/")
+        if rel.endswith("case.json"):
+            if entry.get("abs"):
+                cands.append(entry["abs"])
+            cands.append(os.path.join(work, "inputs", rel))
+    cands += [os.path.join(work, "inputs", "case.json"),
+              os.path.join(work, "case.json")]
+    for cand in cands:
+        try:
+            if cand and os.path.isfile(cand):
+                with open(cand, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                if isinstance(data, dict):
+                    return data, cand
+        except (OSError, ValueError):
+            continue
+    return {}, None
+
+
+def _case_constraints(work, manifest):
+    case, path = _read_case_json(work, manifest)
+    cons = case.get("constraints") if isinstance(case, dict) else None
+    return (cons if isinstance(cons, dict) else {}), path
+
+
+def _start_deck_spec(work):
+    return _load_json(work, "start_deck_spec.json")
+
+
+def _adaptation_actions(work):
+    acts = (_load_json(work, "adaptation_actions.json") or {}).get("actions") or []
+    return [a for a in acts if isinstance(a, dict)]
+
+
+def _slide_index_of(action):
+    for key in ("slide", "start_slide", "index", "n"):
+        try:
+            return int(action.get(key))
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _dropped_start_slides(actions):
+    """{start-deck page index: drop reason} for recorded ``start_deck_slide_dropped``."""
+    out = {}
+    for a in actions:
+        if a.get("kind") != "start_deck_slide_dropped":
+            continue
+        idx = _slide_index_of(a)
+        if idx is None:
+            continue
+        reason = a.get("reason") or a.get("why") or a.get("note") or ""
+        out[idx] = str(reason).strip()
+    return out
+
+
+def _preserved_start_slides(actions):
+    out = set()
+    for a in actions:
+        if a.get("kind") != "start_deck_slide_preserved":
+            continue
+        idx = _slide_index_of(a)
+        if idx is not None:
+            out.add(idx)
+    return out
+
+
+def _norm_cell(value):
+    s = unicodedata.normalize("NFKC", "" if value is None else str(value))
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _table_matches(cells, want):
+    if len(cells) != len(want):
+        return False
+    for got_row, want_row in zip(cells, want):
+        if len(got_row) != len(want_row):
+            return False
+        for got, exp in zip(got_row, want_row):
+            if _norm_cell(got) != _norm_cell(exp):
+                return False
+    return True
+
+
+def _evidence_index(inv, start_spec=None):
+    """notes_evidence id -> source text (units / sections / figures / tables).
+
+    ADDENDUM v1.3 §A4 also allows ``start_deck:<part>`` ids: the starting deck is
+    organiser-supplied draft material, so a script about it is evidenced by the starting
+    deck page itself (``<work>/start_deck_spec.json`` ``slide_details[].text_units``).
+    """
+    idx = {}
+    for it in (inv.get("units") or []):
+        if isinstance(it, dict) and it.get("id"):
+            idx[str(it["id"])] = it.get("text") or ""
+    for it in (inv.get("sections") or []):
+        if isinstance(it, dict) and it.get("id"):
+            idx[str(it["id"])] = it.get("title") or ""
+    for key in ("figures", "tables"):
+        for it in (inv.get(key) or []):
+            if isinstance(it, dict) and it.get("id"):
+                idx[str(it["id"])] = "%s %s" % (it.get("label") or "", it.get("caption") or "")
+    for sd in ((start_spec or {}).get("slide_details") or []):
+        if not isinstance(sd, dict):
+            continue
+        part = sd.get("part")
+        if not part:
+            continue
+        texts = [u["text"] for u in (sd.get("text_units") or [])
+                 if isinstance(u, dict) and (u.get("text") or "").strip()]
+        texts = ([sd.get("title")] if (sd.get("title") or "").strip() else []) + texts
+        idx["start_deck:" + str(part)] = "\n".join(dict.fromkeys(texts))
+    return idx
+
+
+def _notes_content_tokens(text):
+    """Content tokens for speaker notes: word chars minus the connector/stopword set."""
+    return [t for t in _tokens(text or "") if t not in _NOTES_STOP]
+
+
+def _start_deck_texts(spec):
+    """Every text unit in ``start_deck_spec.slide_details`` (v1.3 schema)."""
+    out = []
+    for sd in (spec.get("slide_details") or []):
+        if not isinstance(sd, dict):
+            continue
+        for u in (sd.get("text_units") or []):
+            if isinstance(u, dict) and (u.get("text") or "").strip():
+                out.append(u["text"])
+    return out
+
+
+# --------------------------------------------------------------------------------------
+# v1.3 fidelity checks
+# --------------------------------------------------------------------------------------
+
+def _fidelity_start_deck(deck, plan, work):
+    """start_deck_preserved: every starting-deck text unit survives, or its page is waived."""
+    name = "start_deck_preserved"
+    if not _plan_is_v13(plan):
+        return None, [], [], {"name": name,
+                              "reason": "plan has no v1.3 `mode` key (legacy schema): "
+                                        "start-deck adaptation cannot be judged"}
+    if plan.get("mode") != "adapt_start_deck":
+        return None, [], [], {"name": name,
+                              "reason": "plan.mode=%r: this run does not adapt a starting deck"
+                                        % plan.get("mode")}
+    spec = _start_deck_spec(work)
+    details = [d for d in (spec.get("slide_details") or []) if isinstance(d, dict)]
+    if not spec or spec.get("ok") is not True:
+        chk = _check(name, "fail", "readable start_deck_spec.json with ok=true", 0,
+                     "start_deck_spec.json missing or ok!=true: %r"
+                     % ((spec.get("notes") if isinstance(spec.get("notes"), list) else
+                         spec.get("notes")) or "absent"))
+        return chk, [{"kind": "start_deck_unauditable", "slide": None, "text": "",
+                      "why": "no readable start_deck_spec.json"}], [], None
+    if not details:
+        chk = _check(name, "fail", "v1.3 slide_details in start_deck_spec.json", 0,
+                     "start_deck_spec.json has no slide_details (v1.2 minimal schema): "
+                     "per-page text preservation cannot be audited")
+        return chk, [{"kind": "start_deck_unauditable", "slide": None, "text": "",
+                      "why": "start_deck_spec.json lacks slide_details"}], [], None
+
+    deck_text = "\n".join(sh.get("text") or "" for sl in deck
+                          for sh in sl["shapes"] if sh.get("kind") == "sp")
+    deck_tokens = set(_content_tokens(deck_text))
+    actions = _adaptation_actions(work)
+    dropped = _dropped_start_slides(actions)
+    preserved_actions = _preserved_start_slides(actions)
+    plan_source_pages = {int(sl.get("source_slide")) for sl in (plan.get("slides") or [])
+                         if isinstance(sl, dict) and str(sl.get("source_slide", "")).strip().isdigit()}
+    checked, lost, waived, informational = 0, [], [], []
+    pages_with_text = 0
+    for sd in details:
+        idx = sd.get("index")
+        units = [u for u in (sd.get("text_units") or [])
+                 if isinstance(u, dict) and (u.get("text") or "").strip()]
+        if not units:
+            continue
+        pages_with_text += 1
+        reason = dropped.get(idx)
+        if reason:
+            waived.append({"slide": idx, "reason": reason})
+            if idx not in plan_source_pages and idx not in preserved_actions:
+                informational.append({"kind": "start_slide_drop_not_in_plan", "slide": idx,
+                                      "why": "page dropped with a reason but no plan/action trace "
+                                             "of it being considered"})
+            continue
+        if idx in dropped:
+            informational.append({"kind": "start_slide_drop_without_reason", "slide": idx,
+                                  "why": "start_deck_slide_dropped recorded without a reason; "
+                                         "not a valid waiver"})
+        if idx not in plan_source_pages and idx not in preserved_actions:
+            informational.append({"kind": "start_slide_unreferenced", "slide": idx,
+                                  "why": "page not mapped by any plan slide and no "
+                                         "start_deck_slide_preserved action recorded"})
+        for u in units:
+            toks = _content_tokens(u.get("text") or "")
+            if not toks:
+                continue
+            checked += 1
+            cov = len([t for t in toks if t in deck_tokens]) / float(len(toks))
+            if cov < START_DECK_UNIT_RATIO:
+                lost.append({"slide": idx, "where": u.get("where"),
+                             "text": (u.get("text") or "")[:120],
+                             "coverage": round(cov, 3),
+                             "why": "starting-deck text unit missing from the produced deck"})
+
+    if not pages_with_text:
+        return (_check(name, "skipped", "starting-deck text units", 0,
+                       "start_deck_spec slide_details carry no text units"),
+                [], [], None)
+    if not lost:
+        detail = ("pages with text=%d units checked=%d waived=%d"
+                  % (pages_with_text, checked, len(waived)))
+        chk = _check(name, "pass", "every starting-deck text unit survives (or its page is "
+                     "dropped with a recorded reason)", {"lost": 0, "waived": len(waived)}, detail)
+        return chk, [], informational, None
+    chk = _check(name, "fail", "every starting-deck text unit survives (or its page is "
+                 "dropped with a recorded reason)", len(lost),
+                 "pages with text=%d units checked=%d lost=%d waived=%d"
+                 % (pages_with_text, checked, len(lost), len(waived)))
+    chk["detail_extra"] = lost[:10]
+    return chk, [{"kind": "start_deck_text_dropped", "slide": l["slide"],
+                  "text": l["text"], "why": l["why"]} for l in lost], informational, None
+
+
+def _fidelity_table(deck, plan):
+    """table_rendered: every planned table exists as a real <a:tbl> with matching cells."""
+    name = "table_rendered"
+    planned = []
+    for i, sl in enumerate(plan.get("slides") or [], 1):
+        if not isinstance(sl, dict):
+            continue
+        for t in (sl.get("tables") or []):
+            if isinstance(t, dict):
+                planned.append((i, t))
+    if not planned:
+        return None, [], [], {"name": name, "reason": "slides_plan declares no tables"}
+    deck_tables = []
+    for sl in deck:
+        for tb in (sl.get("tables") or []):
+            deck_tables.append((sl["n"], tb))
+
+    lost = []
+    for i, t in planned:
+        header = [_norm_cell(x) for x in (t.get("header") or [])]
+        rows = [[_norm_cell(c) for c in r] for r in (t.get("rows") or [])
+                if isinstance(r, (list, tuple))]
+        expected = ([header] if any(header) else []) + rows
+        exp_r = len(expected)
+        exp_c = max([len(r) for r in expected] or [0])
+        want = [r + [""] * (exp_c - len(r)) for r in expected]
+        match = None
+        # prefer the plan slide index, then accept the table anywhere (split pages)
+        for n, tb in deck_tables:
+            if n == i and _table_matches(tb.get("cells") or [], want):
+                match = (n, tb)
+                break
+        if match is None:
+            for n, tb in deck_tables:
+                if _table_matches(tb.get("cells") or [], want):
+                    match = (n, tb)
+                    break
+        if match is not None:
+            continue
+        observed = [{"slide": n, "rows": tb.get("rows"), "cols": tb.get("cols")}
+                    for n, tb in deck_tables]
+        why = "no <a:tbl> carries the planned %dx%d table" % (exp_r, exp_c)
+        if not deck_tables:
+            slide_text = "\n".join(sh.get("text") or "" for sl in deck if sl["n"] == i
+                                   for sh in sl["shapes"] if sh.get("kind") == "sp")
+            flat = [c for r in want for c in r if c]
+            hit = sum(1 for c in flat if c and c in _norm_cell(slide_text))
+            if flat and hit / float(len(flat)) >= 0.5:
+                why = ("planned table was flattened into plain text "
+                       "(%d/%d cell strings found in text shapes)" % (hit, len(flat)))
+            elif any(sh.get("kind") == "pic" for sl in deck if sl["n"] == i
+                     for sh in sl["shapes"]):
+                why = "planned table was replaced by a picture"
+        lost.append({"slide": i, "caption": (t.get("caption") or "")[:80],
+                     "expected": "%dx%d" % (exp_r, exp_c),
+                     "observed": observed, "why": why})
+    if not lost:
+        chk = _check(name, "pass", "every planned table is a real <a:tbl> with matching size "
+                     "and cell text", 0,
+                     "planned tables=%d rendered=%d" % (len(planned), len(planned)))
+        return chk, [], [], None
+    chk = _check(name, "fail", "every planned table is a real <a:tbl> with matching size "
+                 "and cell text", len(lost),
+                 "planned tables=%d unrendered=%d deck_tables=%d"
+                 % (len(planned), len(lost), len(deck_tables)))
+    chk["detail_extra"] = lost[:10]
+    return chk, [{"kind": "table_not_rendered", "slide": l["slide"], "text": l["caption"],
+                  "why": l["why"]} for l in lost], [], None
+
+
+def _fidelity_notes(deck, plan, inv, start_spec=None):
+    """notes_evidence_present: non-empty, resolvable, sourced speaker notes.
+
+    Rules (published in ``detail`` for review):
+      * content tokens = word tokens minus the connector/stopword set (``_NOTES_STOP``);
+      * at least ``NOTES_EVIDENCE_RATIO`` (90%) of them must occur in the evidence texts;
+      * every statistic in the script must occur in the evidence texts verbatim;
+      * ``unresolved`` (unknown/absent evidence id) and ``low_overlap`` (sourced but not
+        enough overlap) are counted separately, never merged into one silent skip.
+    """
+    name = "notes_evidence_present"
+    if not _plan_is_v13(plan):
+        return None, [], [], {"name": name,
+                              "reason": "plan has no v1.3 `mode` key (legacy schema): "
+                                        "notes_evidence is not required there"}
+    slides = [sl for sl in (plan.get("slides") or []) if isinstance(sl, dict)]
+    with_notes = [(i, sl) for i, sl in enumerate(slides, 1)
+                  if (sl.get("notes") or "").strip()]
+    if not with_notes:
+        return None, [], [], {"name": name, "reason": "plan carries no speaker notes"}
+
+    index = _evidence_index(inv, start_spec)
+    threshold = NOTES_EVIDENCE_RATIO
+    bad, corpora = [], []
+    unresolved = low_overlap = stat_leak = missing_evidence = 0
+    for i, sl in with_notes:
+        ev = sl.get("notes_evidence")
+        ev = [e for e in ev if isinstance(e, str) and e.strip()] if isinstance(ev, list) else []
+        if not ev:
+            missing_evidence += 1
+            bad.append({"slide": i, "kind": "missing_evidence",
+                        "why": "notes_evidence is missing or empty"})
+            continue
+        unknown = [e for e in ev if e not in index]
+        if unknown:
+            unresolved += 1
+            bad.append({"slide": i, "kind": "unresolved",
+                        "why": "unresolved notes_evidence ids %r" % unknown})
+            continue
+        corpus = "\n".join(index[e] for e in ev)
+        corpora.append(corpus)
+        note = sl.get("notes") or ""
+        toks = _notes_content_tokens(note)
+        if toks:
+            ctoks = set(_notes_content_tokens(corpus))
+            cov = len([t for t in toks if t in ctoks]) / float(len(toks))
+            if cov < threshold:
+                low_overlap += 1
+                bad.append({"slide": i, "kind": "low_overlap",
+                            "why": "only %.0f%% of notes content tokens occur in the "
+                                   "evidence texts (threshold %.0f%%)"
+                                   % (cov * 100.0, threshold * 100.0)})
+        stat_bad = sorted(_stat_tokens(note) - _stat_tokens(corpus))
+        if stat_bad:
+            stat_leak += 1
+            bad.append({"slide": i, "kind": "unsourced_number",
+                        "why": "notes numbers absent from evidence: %s" % stat_bad})
+
+    deck_notes = "\n".join((sl.get("notes_text") or "") for sl in deck
+                           if (sl.get("notes_text") or "").strip())
+    plan_notes = "\n".join((sl.get("notes") or "") for _i, sl in with_notes)
+    deck_low_overlap = deck_stat_leak = 0
+    if not deck_notes.strip():
+        bad.append({"slide": None, "kind": "missing_delivery",
+                    "why": "plan has speaker notes but the pptx carries no notes text"})
+    else:
+        allowed = set(_notes_content_tokens("\n".join(corpora) + "\n" + plan_notes)) | _BOILER
+        dtoks = _notes_content_tokens(deck_notes)
+        if dtoks:
+            cov = len([t for t in dtoks if t in allowed]) / float(len(dtoks))
+            if cov < threshold:
+                deck_low_overlap = 1
+                bad.append({"slide": None, "kind": "deck_low_overlap",
+                            "why": "deck notes text is not backed by any notes_evidence "
+                                   "(content coverage %.0f%%, threshold %.0f%%)"
+                                   % (cov * 100.0, threshold * 100.0)})
+        stat_bad = sorted(_stat_tokens(deck_notes) - _stat_tokens("\n".join(corpora)))
+        if stat_bad:
+            deck_stat_leak = 1
+            bad.append({"slide": None, "kind": "deck_unsourced_number",
+                        "why": "deck notes numbers absent from evidence: %s" % stat_bad})
+
+    rules = ("rules: content-token coverage >= %.0f%% after removing %d connector/stopword "
+             "tokens; every statistic must appear verbatim in the evidence texts; "
+             "unresolved=%d low_overlap=%d unsourced_number=%d missing_evidence=%d "
+             "deck_low_overlap=%d deck_unsourced_number=%d"
+             % (threshold * 100.0, len(_NOTES_STOP), unresolved, low_overlap,
+                stat_leak, missing_evidence, deck_low_overlap, deck_stat_leak))
+    if not bad:
+        chk = _check(name, "pass", "every slide with notes has non-empty resolvable "
+                     "notes_evidence and a script traceable to it", 0,
+                     "slides with notes=%d; %s" % (len(with_notes), rules))
+        return chk, [], [], None
+    chk = _check(name, "fail", "every slide with notes has non-empty resolvable "
+                 "notes_evidence and a script traceable to it", len(bad),
+                 "slides with notes=%d violations=%d; %s"
+                 % (len(with_notes), len(bad), rules))
+    chk["detail_extra"] = bad[:10]
+    return chk, [{"kind": "notes_unsourced", "slide": b.get("slide"), "text": "",
+                  "why": b["why"]} for b in bad], [], None
+
+
 def run_fidelity(work, parts, deck, manifest, inv, plan):
     checks = []
     violations = []
     informational = []
+    not_applicable = []
     metrics = {"deck_text_units": 0, "deck_units_traceable": 0,
                "source_units_covered": 0, "source_units_total": 0,
                "unsourced_deck_strings": [], "figure_refs_checked": 0, "figure_refs_ok": 0}
 
     src_corpus = _source_corpus(inv)
+    # v1.3: a starting deck is real input material, so its own text is a legitimate
+    # source for the adapted deck (otherwise every preserved sentence looks invented).
+    start_spec = _start_deck_spec(work)
+    start_text_chunks = _start_deck_texts(start_spec)
+    if start_text_chunks:
+        src_corpus = src_corpus + "\n" + "\n".join(start_text_chunks)
     plan_corpus = _plan_corpus(plan)
     allowed = set(_content_tokens(src_corpus)) | set(_content_tokens(plan_corpus))
     allowed |= _BOILER
@@ -766,6 +1229,8 @@ def run_fidelity(work, parts, deck, manifest, inv, plan):
     for f in (inv.get("figures") or []) + (inv.get("tables") or []):
         if isinstance(f, dict):
             src_stats |= _stat_tokens(f.get("caption") or "")
+    if start_text_chunks:
+        src_stats |= _stat_tokens("\n".join(start_text_chunks))
     deck_stats = set()
     for txt in deck_by_n.values():
         deck_stats |= _stat_tokens(txt)
@@ -907,6 +1372,24 @@ def run_fidelity(work, parts, deck, manifest, inv, plan):
             violations.append({"kind": "unsourced_notes", "slide": n, "text": "",
                                "why": "notes text absent from source"})
 
+    # --- v1.3: start_deck_preserved / table_rendered / notes_evidence_present ---
+    for helper, args in (("start_deck", (deck, plan, work)),
+                         ("table", (deck, plan)),
+                         ("notes", (deck, plan, inv, start_spec))):
+        if helper == "start_deck":
+            chk, vio, info, na = _fidelity_start_deck(*args)
+        elif helper == "table":
+            chk, vio, info, na = _fidelity_table(*args)
+        else:
+            chk, vio, info, na = _fidelity_notes(*args)
+        if chk is not None:
+            checks.append(chk)
+        if na is not None:
+            not_applicable.append(na)
+            checks.append(_check(na["name"], "not_applicable", None, None, na["reason"]))
+        violations.extend(vio)
+        informational.extend(info)
+
     # --- no raw markup markers leaking into slide text ---
     markup_hits = []
     for sl in deck:
@@ -953,6 +1436,7 @@ def run_fidelity(work, parts, deck, manifest, inv, plan):
                       "violations_demoted_to_informational": demoted},
         "unchecked": [{"name": c["name"], "reason": c["detail"]}
                       for c in checks if c["status"] == "skipped"],
+        "not_applicable": not_applicable,
         "vacuous_skips": vacuous,
         "generated_at": _now(),
         "deck": None,
@@ -969,7 +1453,8 @@ CRITICAL = ("master_inheritance", "layout_link_resolves", "placeholder_idx_exist
             "theme_fonts_preserved", "theme_colors_preserved", "slide_size_preserved",
             "text_no_overflow", "font_size_floor", "figure_aspect_ratio",
             "caption_number_consistency", "batch_consistency",
-            "relationships_resolve", "content_types_default_namespace", "shape_overlap")
+            "relationships_resolve", "content_types_default_namespace", "shape_overlap",
+            "constraints_honoured")
 
 
 def _resolve_template(work, manifest, spec):
@@ -1015,6 +1500,7 @@ def run_format(work, output, parts, deck, manifest, spec, plan):
     inheritance = []
     overflow = []
     aspect = []
+    not_applicable = []
     vacuous = 0
 
     def skip(name, reason):
@@ -1439,6 +1925,7 @@ def run_format(work, output, parts, deck, manifest, spec, plan):
     viol = []
     runs_checked = 0
     scaled_shapes = []
+    eff_runs = []
 
     for sl in deck:
         for sh in sl["shapes"]:
@@ -1458,6 +1945,7 @@ def run_format(work, output, parts, deck, manifest, spec, plan):
                 for sz in para["sizes"]:
                     runs_checked += 1
                     eff = sz * scale
+                    eff_runs.append({"slide": sl["n"], "role": role, "eff_1_100pt": eff})
                     if eff < floors[role]:
                         viol.append({"slide": sl["n"], "shape": sh.get("name"), "role": role,
                                      "declared_sz": sz, "font_scale": round(scale, 5),
@@ -1479,6 +1967,96 @@ def run_format(work, output, parts, deck, manifest, spec, plan):
             checks[-1]["detail_extra"] = sorted(viol, key=lambda v: v["effective_pt"])[:10]
         if scaled_shapes:
             checks[-1]["font_scale_applied"] = scaled_shapes[:10]
+
+    # ---- constraints_honoured (v1.3 ADDENDUM §A5) ----
+    # "We read case.json.constraints" must be provable, not asserted: the run has to carry
+    # the verbatim values into the plan and the produced deck has to obey the hard cap and
+    # the readable-size floor.
+    cons, cons_case_path = _case_constraints(work, manifest)
+    applied = plan.get("constraints_applied") if isinstance(plan.get("constraints_applied"), dict) else {}
+    if not _plan_is_v13(plan):
+        reason = ("plan has no v1.3 `mode` key (legacy schema): the run cannot prove it read "
+                  "case.json.constraints (no verbatim copy / constraints_applied)")
+        not_applicable.append({"name": "constraints_honoured", "reason": reason})
+        checks.append(_check("constraints_honoured", "not_applicable", None, None, reason))
+    elif not cons and not applied:
+        reason = "case.json provides no constraints and the plan records none"
+        not_applicable.append({"name": "constraints_honoured", "reason": reason})
+        checks.append(_check("constraints_honoured", "not_applicable", None, None, reason))
+    else:
+        subs, problems = [], []
+
+        def _sub(name, ok, expected, observed, why=None):
+            subs.append({"name": name, "ok": bool(ok), "expected": expected, "observed": observed})
+            if not ok:
+                problems.append(why or "%s: expected %r observed %r"
+                                % (name, expected, observed))
+
+        tgt = cons.get("target_slide_count")
+        if isinstance(tgt, (int, float)) and not isinstance(tgt, bool) and int(tgt) > 0:
+            tgt = int(tgt)
+            _sub("slide_count_cap", len(deck) <= tgt, tgt, len(deck),
+                 "slide_count %d exceeds target_slide_count %d" % (len(deck), tgt))
+            pv = plan.get("target_slide_count")
+            _sub("target_slide_count_verbatim", pv == tgt, tgt, pv,
+                 "plan.target_slide_count=%r is not case.json.constraints.target_slide_count=%r"
+                 % (pv, tgt))
+        aud = cons.get("audience")
+        if isinstance(aud, str) and aud.strip():
+            pv = plan.get("audience")
+            _sub("audience", isinstance(pv, str) and pv.strip() == aud.strip(), aud[:80], pv,
+                 "plan.audience=%r differs from case.json.constraints.audience=%r" % (pv, aud))
+        tm = cons.get("time_minutes")
+        if isinstance(tm, (int, float)) and not isinstance(tm, bool):
+            pv = plan.get("time_minutes")
+            try:
+                ok = pv is not None and abs(float(pv) - float(tm)) < 1e-6
+            except (TypeError, ValueError):
+                ok = False
+            _sub("time_minutes", ok, tm, pv,
+                 "plan.time_minutes=%r differs from case.json.constraints.time_minutes=%r"
+                 % (pv, tm))
+        case_floor = cons.get("font_size_floor_pt")
+        if isinstance(case_floor, dict):
+            plan_floor = ((plan.get("font_ladder") or {}).get("floor") or {})
+            applied_floor = None
+            if isinstance(applied.get("font_size_floor_pt"), dict):
+                value = applied["font_size_floor_pt"].get("value")
+                applied_floor = value if isinstance(value, dict) else None
+            for role, pt in sorted(case_floor.items()):
+                want = _as_100pt(pt, common.FONT_FLOOR.get(role))
+                got = _as_100pt(plan_floor.get(role), None)
+                if got is None and isinstance(applied_floor, dict):
+                    got = _as_100pt(applied_floor.get(role), None)
+                _sub("font_floor_%s" % role, got is not None and got >= want,
+                     ">= %d (1/100 pt)" % want, got,
+                     "plan font floor for %r is %r, below case.json floor %r"
+                     % (role, got, want))
+                below = [r for r in eff_runs if r["role"] == role and r["eff_1_100pt"] < want]
+                _sub("font_floor_runs_%s" % role, not below, 0, len(below),
+                     "%d rendered %r run(s) below case.json floor %.2f pt"
+                     % (len(below), role, want / 100.0))
+        cn = cons.get("caption_numbering")
+        if isinstance(cn, str) and cn.strip():
+            pv = (plan.get("numbering") or {}).get("mode")
+            _sub("caption_numbering", pv == cn, cn, pv,
+                 "plan.numbering.mode=%r differs from case.json.constraints.caption_numbering=%r"
+                 % (pv, cn))
+        if not subs:
+            reason = "case.json.constraints carries none of audience/time_minutes/" \
+                     "target_slide_count/font_size_floor_pt/caption_numbering"
+            not_applicable.append({"name": "constraints_honoured", "reason": reason})
+            checks.append(_check("constraints_honoured", "not_applicable", None, None, reason))
+        else:
+            chk = _check("constraints_honoured", "fail" if problems else "pass",
+                         "case.json.constraints honoured and carried verbatim into the plan",
+                         len(problems),
+                         "subchecks=%d violated=%d (case.json=%s)"
+                         % (len(subs), len(problems), cons_case_path))
+            chk["subchecks"] = subs
+            if problems:
+                chk["detail_extra"] = problems[:10]
+            checks.append(chk)
 
     # ---- batch consistency ----
     groups = {}
@@ -1613,6 +2191,7 @@ def run_format(work, output, parts, deck, manifest, spec, plan):
         "inheritance_bytes": inherit_bytes,
         "unchecked": [{"name": c["name"], "reason": c["detail"]}
                       for c in checks if c["status"] == "skipped"],
+        "not_applicable": not_applicable,
         "role_resolution": role_sources,
         "font_scale": {"shapes_with_font_scale": scaled_shapes[:40],
                        "count": len(scaled_shapes),
@@ -1667,10 +2246,10 @@ def verify(work_dir: str, output_dir: str) -> dict:
         reason = "missing required inputs: %s" % ", ".join(missing_inputs)
         check = _check("inputs_present", "fail", "all work/deck inputs", len(missing_inputs), reason)
         fid = {"ok": False, "checks": [check], "metrics": {}, "violations": [],
-               "unchecked": [], "vacuous_skips": 0, "generated_at": _now(),
+               "unchecked": [], "not_applicable": [], "vacuous_skips": 0, "generated_at": _now(),
                "deck": deck_path, "note": reason}
         fmt = {"status": "fail", "checks": [check], "overflow": [], "aspect": [],
-               "inheritance": [], "unchecked": [], "vacuous_skips": 0,
+               "inheritance": [], "unchecked": [], "not_applicable": [], "vacuous_skips": 0,
                "generated_at": _now(), "note": reason}
         common.write_json(os.path.join(work_dir, "fidelity_report.json"), fid)
         common.write_json(os.path.join(work_dir, "format_audit.json"), fmt)
@@ -1686,10 +2265,10 @@ def verify(work_dir: str, output_dir: str) -> dict:
         reason = "deck is not a readable zip: %s: %s" % (type(exc).__name__, exc)
         check = _check("deck_readable", "fail", "readable pptx zip", 0, reason)
         fid = {"ok": False, "checks": [check], "metrics": {}, "violations": [],
-               "unchecked": [], "vacuous_skips": 0, "generated_at": _now(),
+               "unchecked": [], "not_applicable": [], "vacuous_skips": 0, "generated_at": _now(),
                "deck": deck_path, "note": reason}
         fmt = {"status": "fail", "checks": [check], "overflow": [], "aspect": [],
-               "inheritance": [], "unchecked": [], "vacuous_skips": 0,
+               "inheritance": [], "unchecked": [], "not_applicable": [], "vacuous_skips": 0,
                "generated_at": _now(), "note": reason}
         common.write_json(os.path.join(work_dir, "fidelity_report.json"), fid)
         common.write_json(os.path.join(work_dir, "format_audit.json"), fmt)
@@ -1708,12 +2287,23 @@ def verify(work_dir: str, output_dir: str) -> dict:
     fmt["slide_count"] = len(deck)
     common.write_json(os.path.join(work_dir, "fidelity_report.json"), fid)
     common.write_json(os.path.join(work_dir, "format_audit.json"), fmt)
+
+    v13_status = {}
+    for name in V13_CHECKS:
+        status = None
+        for c in list(fid.get("checks") or []) + list(fmt.get("checks") or []):
+            if c.get("name") == name:
+                status = c.get("status")
+                break
+        v13_status[name] = status
+    na = (fid.get("not_applicable") or []) + (fmt.get("not_applicable") or [])
     return {"ok": bool(fid.get("ok")) and fmt.get("status") != "fail",
             "fidelity_ok": bool(fid.get("ok")), "format_status": fmt.get("status"),
             "fidelity": fid, "format": fmt,
             "fidelity_report": os.path.join(work_dir, "fidelity_report.json"),
             "format_audit": os.path.join(work_dir, "format_audit.json"),
             "deck": fid["deck"], "slide_count": len(deck),
+            "v13": v13_status, "not_applicable": na,
             "vacuous_skips": int(fid.get("vacuous_skips", 0)) + int(fmt.get("vacuous_skips", 0))}
 
 
