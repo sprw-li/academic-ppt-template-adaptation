@@ -1,16 +1,17 @@
 {
   "example": true,
   "example_id": "EXAMPLE-ppt-710fbc72-001",
-  "example_note": "EXAMPLE ONLY — synthetic interface illustration. Not an official case, not a prepared answer, not a run result and not a score. No template, paper or figure bytes exist for this example; every material is marked available_in_this_example=false.",
+  "example_note": "EXAMPLE ONLY — synthetic interface illustration for the v1.3 additions (start_deck adaptation, constraints, editable tables, speaker notes). Not an official case, not a prepared answer, not a run result and not a score. No template, start deck, paper, figure or table bytes exist for this example; every material is marked available_in_this_example=false.",
   "case_id": "EXAMPLE-ppt-710fbc72-001",
   "task_type": "academic_ppt_template_adaptation",
   "materials": [
     {"rel": "template.pptx", "kind": "pptx", "role_hint": "template", "available_in_this_example": false},
+    {"rel": "start_deck.pptx", "kind": "pptx", "role_hint": "start_deck", "available_in_this_example": false},
     {"rel": "paper.md", "kind": "md", "role_hint": "source", "available_in_this_example": false},
     {"rel": "fig/fig1.png", "kind": "png", "role_hint": "figure", "available_in_this_example": false},
-    {"rel": "start_deck.pptx", "kind": "pptx", "role_hint": "start_deck", "available_in_this_example": false}
+    {"rel": "data/table1.csv", "kind": "csv", "role_hint": "table", "available_in_this_example": false}
   ],
-  "instructions": "EXAMPLE instruction text. Build a 15-minute, roughly 3-slide academic talk from paper.md into template.pptx: keep the source figure numbering, add speaker notes, and export a real preview. This text is synthetic and must not be reused as a real case instruction.",
+  "instructions": "EXAMPLE instruction text. Adapt the existing 4-slide start deck into template.pptx for a 15-minute lab meeting, at most 4 slides, keeping every start-deck sentence and the source table numbering; render the source table as a real editable table, add speakable speaker notes sourced from the materials, and export a real preview. This text is synthetic and must not be reused as a real case instruction.",
   "output_contract": {
     "identification": {
       "case_id": "EXAMPLE-ppt-710fbc72-001",
@@ -44,10 +45,18 @@
       "language": "zh"
     }
   },
-  "constraints": [
-    "EXAMPLE constraint: the delivered pptx must show a verifiable template master/layout/theme inheritance chain.",
-    "EXAMPLE constraint: never shrink text below the readable floor; split the slide instead.",
-    "EXAMPLE constraint: figures keep their aspect ratio and their source numbering by default.",
-    "EXAMPLE constraint: report honest status, uncertainty and change records; do not fabricate previews."
-  ]
+  "constraints": {
+    "audience": "EXAMPLE 课题组周会（仅示例文字）",
+    "time_minutes": 15,
+    "target_slide_count": 4,
+    "caption_numbering": "preserve_source",
+    "font_size_floor_pt": {"body": 14, "caption": 12},
+    "notes": [
+      "EXAMPLE constraint: the delivered pptx must show a verifiable template master/layout/theme inheritance chain.",
+      "EXAMPLE constraint: never shrink text below the readable floor; split the slide instead.",
+      "EXAMPLE constraint: figures keep their aspect ratio and their source numbering by default.",
+      "EXAMPLE constraint: report honest status, uncertainty and change records; do not fabricate previews.",
+      "EXAMPLE: audience/time_minutes/target_slide_count/font_size_floor_pt/caption_numbering are invented values that only demonstrate the constraint keys a real case.json may carry; a real run must copy the actual values and record them in slides_plan.json.constraints_applied."
+    ]
+  }
 }
