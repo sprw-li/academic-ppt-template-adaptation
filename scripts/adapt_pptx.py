@@ -318,12 +318,17 @@ def _sp_tree():
     return tree
 
 
-def _add_text_paragraph(txbody, text, lvl, sz, bold=False, lang="zh-CN"):
+def _add_text_paragraph(txbody, text, lvl, sz, bold=False, lang="zh-CN", bullet=False):
     p = sub(txbody, "a:p")
     attrs = {"algn": "l"}
     if lvl:
         attrs["lvl"] = lvl
-    sub(p, "a:pPr", **attrs)
+    ppr = sub(p, "a:pPr", **attrs)
+    if bullet and text:
+        # an explicit glyph keeps list structure visible even when the master's bodyStyle
+        # does not define one; the font/size still come from the theme
+        sub(ppr, "a:buFont", typeface="Arial")
+        sub(ppr, "a:buChar", char="•" if not lvl else "–")
     if text == "":
         sub(p, "a:endParaRPr", lang=lang)
         return p
@@ -339,7 +344,7 @@ def _add_text_paragraph(txbody, text, lvl, sz, bold=False, lang="zh-CN"):
 
 
 def _placeholder_sp(shape_id, name, ph_type, ph_idx, xfrm, paragraphs, size, *, bold=False,
-                    body_pr=None, substituted=False):
+                    body_pr=None, substituted=False, bullet=False):
     sp = ET.Element(q("p:sp"))
     nv = sub(sp, "p:nvSpPr")
     sub(nv, "p:cNvPr", id=shape_id, name=name)
@@ -368,7 +373,8 @@ def _placeholder_sp(shape_id, name, ph_type, ph_idx, xfrm, paragraphs, size, *, 
     sub(bp, "a:normAutofit")
     sub(tx, "a:lstStyle")
     for para in paragraphs:
-        _add_text_paragraph(tx, plain_text(para.get("text", "")), para.get("level", 0), size, bold=bold)
+        _add_text_paragraph(tx, plain_text(para.get("text", "")), para.get("level", 0), size,
+                            bold=bold, bullet=bullet)
     if not paragraphs:
         _add_text_paragraph(tx, "", 0, size, bold=bold)
     return sp
@@ -391,6 +397,54 @@ def _picture_sp(shape_id, name, rid, xfrm, descr=None):
     sub(x, "a:ext", cx=xfrm["cx"], cy=xfrm["cy"])
     sub(sp, "a:prstGeom", prst="rect")
     return pic
+
+
+def table_frame(shape_id, name, rect, header, rows, size=1200):
+    """A real, editable DrawingML table (``<a:tbl>``) — never an image or a text dump.
+
+    v1.3 §A3: cell text must equal the planned data word for word, and row/column counts must
+    match, so an auditor can recompute the correspondence without rendering.
+    """
+    cols = max([len(header) if header else 0] + [len(r) for r in (rows or [])] + [1])
+    body = list(rows or [])
+    data = ([list(header)] if header else []) + body
+    nrows = max(1, len(data))
+    gf = ET.Element(q("p:graphicFrame"))
+    nv = sub(gf, "p:nvGraphicFramePr")
+    sub(nv, "p:cNvPr", id=shape_id, name=name)
+    sub(nv, "p:cNvGraphicFramePr")
+    sub(nv, "p:nvPr")
+    xf = sub(gf, "p:xfrm")
+    sub(xf, "a:off", x=xfrm_rect(rect, "x"), y=xfrm_rect(rect, "y"))
+    sub(xf, "a:ext", cx=xfrm_rect(rect, "cx"), cy=xfrm_rect(rect, "cy"))
+    graphic = sub(gf, "a:graphic")
+    gd = sub(graphic, "a:graphicData", uri="http://schemas.openxmlformats.org/drawingml/2006/table")
+    tbl = sub(gd, "a:tbl")
+    sub(tbl, "a:tblPr", firstRow="1" if header else None, bandRow="1")
+    grid = sub(tbl, "a:tblGrid")
+    col_w = max(1, rect["cx"] // cols)
+    for _ in range(cols):
+        sub(grid, "a:gridCol", w=col_w)
+    row_h = max(1, rect["cy"] // nrows)
+    for r in data:
+        tr = sub(tbl, "a:tr", h=row_h)
+        cells = list(r) + [""] * (cols - len(r))
+        for cell_text in cells:
+            tc = sub(tr, "a:tc")
+            tx = sub(tc, "a:txBody")
+            sub(tx, "a:bodyPr")
+            sub(tx, "a:lstStyle")
+            p = sub(tx, "a:p")
+            sub(p, "a:pPr", algn="l")
+            run = sub(p, "a:r")
+            sub(run, "a:rPr", lang="zh-CN", sz=size, dirty="0")
+            sub(run, "a:t").text = plain_text(str(cell_text))
+            sub(tc, "a:tcPr")
+    return gf
+
+
+def xfrm_rect(rect, key):
+    return int(rect.get(key) or 0)
 
 
 def slide_xml(sp_tree):
@@ -427,6 +481,16 @@ NOTES_MASTER = b"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 # 3. layout choice + text fitting
 # ======================================================================================
 
+def _role_of_ph_type(t):
+    """Normalise OOXML placeholder types to the coarse roles used for layout matching."""
+    t = (t or "body").strip()
+    if t in ("title", "ctrTitle"):
+        return "title"
+    if t in ("body", "obj", "subTitle"):
+        return "body"
+    return t
+
+
 def choose_layout(tpl, slide, default_part=None):
     want_part = slide.get("layout_part")
     if want_part and want_part in tpl.parts:
@@ -436,6 +500,27 @@ def choose_layout(tpl, slide, default_part=None):
         for lp in tpl.layouts:
             meta = tpl.layout_meta(lp)
             if C.norm_key(meta["name"]) == want_name:
+                return lp
+    # v1.3: map a starting-deck layout onto a template layout by placeholder signature.
+    # discover reports both the coarse signature (title/body) and the raw ph types
+    # (title/obj), so compare in the coarse role space.
+    raw_sig = slide.get("placeholder_types") or slide.get("placeholder_signature")
+    if raw_sig:
+        want = {_role_of_ph_type(t) for t in raw_sig if t}
+        if want:
+            best = None
+            for lp in tpl.layouts:
+                have = {_role_of_ph_type(k[0]) for k in tpl.layout_meta(lp)["placeholders"]}
+                if want <= have:
+                    score = len(have)
+                    if best is None or score < best[0]:
+                        best = (score, lp)
+            if best:
+                return best[1]
+    start_name = C.norm_key(slide.get("start_layout_name") or "")
+    if start_name:
+        for lp in tpl.layouts:
+            if C.norm_key(tpl.layout_meta(lp)["name"]) == start_name:
                 return lp
     role = (slide.get("role") or "").lower()
     if role in ("title", "cover") or slide.get("n") == 1:
@@ -556,6 +641,22 @@ class Adapter:
         self.fig_index = {}
         for f in (self.inventory.get("figures") or []):
             self.fig_index[f.get("id")] = f
+        # v1.3: organizer-provided starting deck (edit/adapt mode)
+        self.start_details = {}
+        self.start_zip = None
+        sd = C.read_json(os.path.join(work_dir, "start_deck_spec.json"), {}) or {}
+        if sd.get("ok") and (sd.get("slide_details") or []):
+            for det in sd.get("slide_details") or []:
+                self.start_details[det.get("index")] = det
+            sp = resolve_input(work_dir, sd.get("path"))
+            if sp:
+                try:
+                    self.start_zip = zipfile.ZipFile(sp)
+                except Exception:
+                    self.start_zip = None
+            self.start_deck_sha256 = sd.get("sha256")
+        self.start_path = sd.get("path")
+        self.start_slide_count = int(sd.get("slide_count") or 0)
 
     # ---- bookkeeping -------------------------------------------------------------
     def action(self, kind, slide, target, before, after, evidence, note=""):
@@ -571,6 +672,28 @@ class Adapter:
     def _next_shape_id(self):
         self.shape_seq += 1
         return self.shape_seq
+
+    def add_media_bytes(self, data, hint=""):
+        """Register raw image bytes (e.g. a picture embedded in the starting deck)."""
+        sha = C.sha256_bytes(data)
+        for src, mem in self.media.items():
+            if mem.get("sha256") == sha:
+                return mem
+        nat = C.natural_size(data)
+        kind = "png"
+        if data[:3] == b"\xff\xd8\xff":
+            kind = "jpeg"
+        elif data[:6] in (b"GIF87a", b"GIF89a"):
+            kind = "gif"
+        elif data[:2] == b"BM":
+            kind = "bmp"
+        ext = "png" if kind == "png" else ("jpeg" if kind == "jpeg" else kind)
+        self.media_seq += 1
+        part = "ppt/media/adaptImage%d.%s" % (self.media_seq, ext)
+        mem = {"part": part, "sha256": sha, "bytes": len(data), "ext": ext, "kind": kind,
+               "natural": nat, "data": data, "hint": hint}
+        self.media["deck:%s" % sha] = mem
+        return mem
 
     def add_media(self, path):
         if path in self.media:
@@ -703,10 +826,19 @@ class Adapter:
         for fig in figures:
             raw = fig.get("asset") or (self.fig_index.get(fig.get("source")) or {}).get("asset")
             src = resolve_input(self.work, raw) if raw else None
+            mem = None
+            if not src and fig.get("source_deck_media") and self.start_zip is not None:
+                try:
+                    mem = self.add_media_bytes(self.start_zip.read(fig["source_deck_media"]),
+                                               hint=fig["source_deck_media"])
+                    src = "deck:%s" % mem["sha256"]
+                except Exception:
+                    src, mem = None, None
             if src:
-                fig_items.append((fig, src))
+                fig_items.append((fig, src, mem))
             else:
-                self.action("figure_missing", n, fig.get("source") or "?", "declared figure asset",
+                self.action("figure_missing", n, fig.get("source") or fig.get("source_deck_media") or "?",
+                            "declared figure asset",
                             "asset not resolvable; caption kept, image omitted",
                             [json.dumps(fig, ensure_ascii=False)], "honest degradation")
         img_rids = {i: "rId%d" % (2 + i) for i in range(len(fig_items))}
@@ -725,7 +857,7 @@ class Adapter:
             body_h_emu = int(body_rect["h_pt"] * C.EMU_PER_PT)
             # Size each caption strip from its measured height before fixing the figure band,
             # so the band can grow instead of the caption being squeezed below the floor.
-            for i, (fig, src) in enumerate(fig_items):
+            for i, (fig, src, _mem0) in enumerate(fig_items):
                 cap = plain_text(fig.get("caption_plain") or fig.get("caption") or "")
                 csize, need = (cap_ladder[-1] if cap_ladder else floor_cap), 0
                 if cap:
@@ -747,6 +879,26 @@ class Adapter:
                 text_rect = dict(body_rect)
                 text_rect["cy"] = text_h
                 text_rect["h_pt"] = C.emu_to_pt(text_h)
+
+        tables_plan = [t for t in (plan_slide.get("tables") or [])
+                       if (t.get("rows") or t.get("header"))]
+        tab_rects = []
+        if tables_plan and body_rect:
+            if fig_box is not None:
+                th = fig_box["cy"] // 2
+                fig_box = dict(fig_box)
+                fig_box["cy"] = max(1, fig_box["cy"] - th)
+                tab_rects = [{"x": body_rect["x"], "y": fig_box["y"] + fig_box["cy"] + gap,
+                              "cx": body_rect["cx"], "cy": max(1, th - gap)}]
+            else:
+                th = int(body_rect["h_pt"] * 0.55 * C.EMU_PER_PT)
+                tab_rects = [{"x": body_rect["x"], "y": body_rect["y"] + body_rect["cy"] - th,
+                              "cx": body_rect["cx"], "cy": th}]
+                new_h = body_rect["cy"] - th - gap
+                if new_h > 0:
+                    text_rect = dict(body_rect)
+                    text_rect["cy"] = new_h
+                    text_rect["h_pt"] = C.emu_to_pt(new_h)
 
         chosen, metrics, hist = fit_size(bullets, text_rect, ladder, floor_body)
         split_chunks = None
@@ -789,7 +941,8 @@ class Adapter:
             if body_key is not None:
                 tree.append(_placeholder_sp(self._next_shape_id(), "Content Placeholder",
                                            body_key[0], body_key[1], (body_info or {}).get("xfrm"),
-                                           body_paras, chosen, body_pr=(body_info or {}).get("body_pr")))
+                                           body_paras, chosen, body_pr=(body_info or {}).get("body_pr"),
+                                           bullet=True))
                 added.append("body")
                 self.record(n, "placeholder_fill", "ppt/slides/slide%d.xml" % n, None,
                             {"ph": list(body_key), "sz": chosen, "bullets": len(body_paras)}, layout_part)
@@ -798,7 +951,7 @@ class Adapter:
                                          "cy": size["cy"] - 2286000}
                 synth = {"x": sub_rect["x"], "y": sub_rect["y"], "cx": sub_rect["cx"], "cy": sub_rect["cy"]}
                 tree.append(_placeholder_sp(self._next_shape_id(), "Substituted Body", None, None,
-                                           synth, body_paras, chosen, substituted=True))
+                                           synth, body_paras, chosen, substituted=True, bullet=True))
                 added.append("body_substituted")
                 self.action("placeholder_substitute", n, layout_part, "layout has no body placeholder",
                             "explicit text box inside the largest declared rect",
@@ -806,9 +959,9 @@ class Adapter:
                             "kept the layout's geometry so overflow stays checkable")
                 self.record(n, "placeholder_substitute", "ppt/slides/slide%d.xml" % n, None, synth, layout_part)
 
-        for i, (fig, src) in enumerate(fig_items):
-            mem = self.add_media(src)
-            nat = C.natural_size(src)
+        for i, (fig, src, mem0) in enumerate(fig_items):
+            mem = mem0 or self.add_media(src)
+            nat = (mem0 or {}).get("natural") or C.natural_size(src)
             iw, ih = (nat if nat else (1000, 1000))
             cell = fig_rects[i] if i < len(fig_rects) else {
                 "x": body_rect["x"], "y": body_rect["y"], "cx": body_rect["cx"],
@@ -847,10 +1000,45 @@ class Adapter:
                              "lines": (cap_metrics or {}).get("lines")},
                             "template_layout geometry; caption normalised to one paragraph")
 
+        for ti, tp in enumerate(tables_plan):
+            rect = tab_rects[ti] if ti < len(tab_rects) else (body_rect or {
+                "x": 914400, "y": 1600200, "cx": size["cx"] - 1828800, "cy": size["cy"] - 2286000})
+            cap_t = plain_text(tp.get("caption") or "")
+            cap_h = 0
+            if cap_t:
+                m = C.estimate_wrapped_lines(cap_t, 12.0,
+                                             max(1.0, (C.emu_to_pt(rect["cx"]) - 2 * C.emu_to_pt(TEXT_INSET_L)) * SAFE_W),
+                                             line_spacing=SAFE_LINE_SPACING)
+                cap_h = int(m["height_pt"] * C.EMU_PER_PT) + 2 * TEXT_INSET_T
+                cap_h = min(cap_h, max(1, rect["cy"] // 3))
+            tbl_rect = dict(rect)
+            tbl_rect["cy"] = max(1, rect["cy"] - cap_h)
+            header = [str(x) for x in (tp.get("header") or [])]
+            rows = [[str(c) for c in r] for r in (tp.get("rows") or [])]
+            tree.append(table_frame(self._next_shape_id(), "Table %d" % (ti + 1), tbl_rect,
+                                    header, rows, size=1200))
+            added.append("table:%s" % (tp.get("source") or ti))
+            self.action("table_rendered", n, "ppt/slides/slide%d.xml" % n,
+                        {"header_cells": len(header), "data_rows": len(rows),
+                         "source": tp.get("source")},
+                        {"cols": max([len(header)] + [len(r) for r in rows] + [1]),
+                         "rows": (1 if header else 0) + len(rows),
+                         "rect": {k: tbl_rect[k] for k in ("x", "y", "cx", "cy")}},
+                        [cap_t or "planned table"], "real editable <a:tbl>, cell text equals the planned data")
+            self.record(n, "table_rendered", "ppt/slides/slide%d.xml" % n, None,
+                        {"rows": len(rows), "header": len(header)}, "plan.tables")
+            if cap_t:
+                cap_rect = {"x": rect["x"], "y": rect["y"] + tbl_rect["cy"], "cx": rect["cx"],
+                            "cy": max(1, cap_h)}
+                tree.append(_placeholder_sp(self._next_shape_id(), "Figure Caption", None, None,
+                                            cap_rect, [{"text": cap_t, "level": 0}], 1200,
+                                            substituted=True))
+                added.append("caption:table")
+
         xml = slide_xml(tree)
         rels = {"rId1": {"type": C.RT["slideLayout"], "target": "../slideLayouts/%s" % os.path.basename(layout_part)}}
-        for i, (fig, src) in enumerate(fig_items):
-            mem = self.add_media(src)
+        for i, (fig, src, mem0) in enumerate(fig_items):
+            mem = mem0 or self.add_media(src)
             rels[img_rids[i]] = {"type": C.RT["image"], "target": mem["part"].replace("ppt/", "../")}
 
         return {"xml": xml, "rels": rels, "layout": layout_part, "meta": meta,
@@ -883,6 +1071,15 @@ class Adapter:
             ps = dict(ps)
             ps["n"] = n
             built = self.build_slide(ps)
+            if ps.get("source_slide"):
+                # v1.3 §A3: proves the starting deck's slide was carried over, not rebuilt
+                self.action("start_deck_slide_preserved", n, "ppt/slides/slide%d.xml" % n,
+                            {"source_slide": ps["source_slide"], "deck": self.start_path,
+                             "deck_sha256": getattr(self, "start_deck_sha256", None)},
+                            {"layout": built["layout"], "title": ps.get("title"),
+                             "bullets": len(ps.get("bullets") or [])},
+                            ["%s#slide%s" % (self.start_path, ps["source_slide"])],
+                            "start-deck text kept word for word; only layout/typography adapted")
             out_slides.append(built)
             if built.get("chunks") and len(built["chunks"]) > 1:
                 self.action("text_split", n, "ppt/slides/slide%d.xml" % n,
@@ -898,6 +1095,20 @@ class Adapter:
                     built_c = self.build_slide(cont, continuation_of=ps.get("title") or "",
                                                paragraphs=chunk)
                     out_slides.append(built_c)
+
+        # v1.3: a starting-deck slide missing from the plan must be recorded, never silently lost
+        used = {int(ps.get("source_slide")) for ps in plan_slides if ps.get("source_slide")}
+        for idx in sorted(self.start_details.keys()):
+            if idx not in used:
+                det = self.start_details[idx]
+                body = "\n".join((u.get("text") or "") for u in (det.get("text_units") or []))
+                self.action("start_deck_slide_dropped", None, det.get("part"),
+                            {"source_slide": idx, "title": det.get("title"),
+                             "text_sha256": C.sha256_bytes(body.encode("utf-8")),
+                             "chars": len(body)},
+                            "not represented in the output deck",
+                            ["%s#slide%s" % (self.start_path, idx)],
+                            "explicit record so an auditor can judge whether a fact was dropped")
 
         # notes
         res = self.assemble(out_slides, plan_slides)
@@ -1037,7 +1248,10 @@ class Adapter:
 
         # media
         for src, mem in self.media.items():
-            parts[mem["part"]] = open(src, "rb").read()
+            if mem.get("data") is not None:
+                parts[mem["part"]] = mem["data"]
+            else:
+                parts[mem["part"]] = open(src, "rb").read()
 
         # write
         deck_path = os.path.join(self.output, self.deck_name)
@@ -1171,7 +1385,10 @@ def adapt(work_dir, output_dir):
 
     counts = {"slides": res["slides"], "placeholders_filled": 0, "substitutions": 0,
               "figure_fits": 0, "font_downgrades": 0, "splits": 0, "notes": 0,
-              "figure_missing": 0, "notes_master_added": 1 if res.get("notes_master_added") else 0}
+              "figure_missing": 0, "notes_master_added": 1 if res.get("notes_master_added") else 0,
+              "tables_rendered": 0, "start_deck_slides_preserved": 0,
+              "start_deck_slides_dropped": 0,
+              "mode": (plan.get("mode") or "from_template")}
     for a in ad.actions:
         kind = a["kind"]
         if kind in ("placeholder_fill",):
@@ -1186,6 +1403,12 @@ def adapt(work_dir, output_dir):
             counts["notes"] += 1
         elif kind == "figure_missing":
             counts["figure_missing"] += 1
+        elif kind == "table_rendered":
+            counts["tables_rendered"] += 1
+        elif kind == "start_deck_slide_preserved":
+            counts["start_deck_slides_preserved"] += 1
+        elif kind == "start_deck_slide_dropped":
+            counts["start_deck_slides_dropped"] += 1
     # placeholder_fill is recorded (change ledger) rather than actioned above
     counts["placeholders_filled"] = sum(1 for r in ad.records if r["kind"] == "placeholder_fill")
     counts["notes"] = sum(1 for r in ad.records if r["kind"] == "notes") or counts["notes"]
