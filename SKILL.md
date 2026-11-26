@@ -1,6 +1,6 @@
 ---
 name: academic-ppt-template-adaptation
-description: Adapt a fixed paper or research-material pack into a real organizer-provided academic PPTX template while preserving every scientific content unit. Use when the task is to read /input/case.json and its real materials (template.pptx, paper.pdf/docx/md/txt, figure files, optional start deck) and produce an editable slides.pptx that inherits the template master, layout, theme and placeholders, plus speaker notes, a page-level evidence map, change records and real rendered PDF/PNG previews under /app/output with result.json. It reads the true OOXML master/layout/theme/placeholder structure, fills placeholders in the correct layout, keeps source figure numbering by default, scales images proportionally, holds a readable font floor (splits a slide instead of squeezing), and reports honest ok/partial/needs_human status. Do not use it for free-form slide design with no source material or no template, for rewriting or summarizing the science beyond what the sources state, for editing legacy .ppt or macro .pptm decks, for merging several templates, for downloading templates at runtime, or for producing prepared answers, whiteboards or scores for the fixed cases.
+description: Adapt a fixed paper or research-material pack into a real organizer-provided academic PPTX template while preserving every scientific content unit. Use when the task is to read /input/case.json and its real materials (template.pptx, paper.pdf/docx/md/txt, figure files, optional start deck) and produce an editable slides.pptx that inherits the template master, layout, theme and placeholders, plus speaker notes, a page-level evidence map, change records and real rendered PDF/PNG previews under /app/output with result.json. It reads the true OOXML master/layout/theme/placeholder structure, chooses mode from_template or adapt_start_deck from real evidence, preserves the starting deck text it is asked to adapt, honours case constraints (audience, time_minutes, target_slide_count, font_size_floor_pt, caption_numbering) and records them in constraints_applied, renders planned tables as real editable OOXML a:tbl graphics frames instead of pictures, writes speakable speaker notes whose content is traceable to notes_evidence, fills placeholders in the correct layout, keeps source figure numbering by default, scales images proportionally, holds a readable font floor (splits a slide instead of squeezing), and reports honest ok/partial/needs_human status. Do not use it for free-form slide design with no source material or no template, for rewriting or summarizing the science beyond what the sources state, for editing legacy .ppt or macro .pptm decks, for merging several templates, for downloading templates at runtime, or for producing prepared answers, whiteboards or scores for the fixed cases.
 ---
 
 # 学术 PPT 模板与格式适配（真实母版/版式/主题继承 + 页级证据映射）
@@ -18,6 +18,19 @@ description: Adapt a fixed paper or research-material pack into a real organizer
 - 预算：64 model requests / 900 秒 / 单响应 16384 token。**先把诚实 partial 落盘，再逐步改善**。
 - 资源：Skill 本体是可安装文本资源；**不得把二进制 pptx/PDF/PNG 打包进 Skill 本体**，不得预制答案。
 
+### 1.1 运行模式：`from_template` 与 `adapt_start_deck`（v1.3）
+
+计划与审计里的 `mode` 只有两个冻结值，**只能由真实证据决定**，不得凭"看起来像有起始 deck"猜：
+
+| `mode` | 何时使用 | 判定证据 |
+|---|---|---|
+| `from_template` | 任务只是把材料套进模板；没有起始 deck，或起始 deck 不是本次要编辑的对象 | `case_manifest.json` 的 `detected.start_deck` 为空，或 `start_deck_spec.json` 的 `ok=false`（坏 zip / 不可解析），或任务说明明确"从模板新建" |
+| `adapt_start_deck` | 题面/`case.json.instructions` 要求**在已有 deck 上编辑或适配**，且起始 deck 可解析 | `detected.start_deck` 唯一命中 **且** `start_deck_spec.json.ok=true` **且** `slide_count>0`，三者同时成立 |
+
+- 自动判定（`run.py` 的 `auto_derived` 计划与 agent 计划都遵守同一条规则）：上面三个条件**同时成立**时 `mode="adapt_start_deck"` 并把 `detected.start_deck` 的真实相对路径写进计划的 `start_deck_path`；否则 `mode="from_template"`、`start_deck_path=null`。
+- 证据冲突（有起始 deck 但 `ok=false`；任务要求 adapt 却找不到起始 deck；多个候选）时**不得静默选一个**：按可核证的那条执行，把另一条写进 plan `notes` 与 `result.json.open_items.uncertainty`，审计里对应的 `start_deck_preserved` 记为 `skipped`（不是 `pass`）。
+- `mode` 一旦由证据确定，就决定 §2 第 11 条（起始 deck 内容保留）是否适用：`from_template` 下该项为 `skipped`，`adapt_start_deck` 下为强制检查。
+
 ## 2. 必须遵守的铁律
 
 1. **先保真再外观。** 不改写正文事实，不删/并/重建图、表、公式、引用与图号。`fidelity_report.json` 的 `ok=false` 是**硬失败**：不得声明 `ok` 或"完成"。
@@ -30,6 +43,10 @@ description: Adapt a fixed paper or research-material pack into a real organizer
 8. **预算内先产出诚实 partial。** 时间/请求紧张时用 `run.py all` 一次性走完全流程（auto 计划走同一套门禁）；宁可交付带明确缺口的 `partial`，也不要为"全绿"编造证据。
 9. **报告字段与命令必须与冻结接口一致。** 不新增未冻结选项、不虚构文件名或状态、不编造 hash/字体/渲染结果。
 10. **跳过不等于通过。** `skipped`/`unchecked`/`unsupported` 一律不得计作 `pass`；未检查项必须出现在报告里。
+11. **起始 deck 的内容必须保留（v1.3，仅 `mode=adapt_start_deck`）。** 起始 deck 每页的每个文本单元都要出现在输出 deck（允许**重排页序**、按 `font_ladder` **降字号**、因溢出**拆页**并加 "(续)"），**不得删改事实**：不改写、不摘要、不合并句子、不改数字与单位。起始 deck 里存在而计划未列出的页**必须保留**为一页（默认追加在末尾），并在 `adaptation_actions.json` 记 `start_deck_slide_preserved`。确需删除一页时**必须**记 `start_deck_slide_dropped` + 删除理由 + 该页文本 hash，否则 `format_audit.checks` 的 `start_deck_preserved` 判 `fail`。
+12. **`case.json.constraints` 必须逐项遵从并留痕（v1.3）。** `audience` / `time_minutes` / `target_slide_count` / `font_size_floor_pt` / `caption_numbering` 一旦在 `case.json.constraints` 里提供，就必须真实反映到计划与 deck，并在计划的 `constraints_applied` 里**逐项**记"值 + 取自哪"（形如 `{"value": …, "source": "case.json:constraints.audience"}`）。`target_slide_count` 是**硬上限**，实际页数不得超过；`font_size_floor_pt` 是字号下限的**来源**，不得低于它。案例没提供某项时如实置 `null`/省略并在 `notes` 说明，**不得凭空编造听众或时长**。
+13. **表格必须是可真编辑的表格（v1.3）。** 计划里 `tables[]` 非空时，必须在 slide 里写出真正的 `<p:graphicFrame><a:graphic><a:graphicData uri="…/table"><a:tbl>`：行列数与 `header`/`rows` 一致，单元格文字逐字来自计划数据。**禁止**把表格降级为图片截图、一条 `a:tbl` 之外的纯文本行、或"表见正文"式引用；做不到就如实记 `unresolved` 并降级，不得伪装成通过。
+14. **讲稿必须是可朗读的句子且有来源（v1.3）。** 每页 `notes` 要能直接念出来（说明"本页主张 → 依据 → 与下一页的衔接"），**不能**只是 `来源：locator` 这类定位串；`notes_evidence` 必填且非空，讲稿里的每个内容 token 必须能在其 evidence 指向的 `units[]/sections[]/figures[]/tables[]` 文本里找到。不得引入源材料没有的事实，不得用讲稿补造数据。
 
 ## 3. 标准运行（两命令 + 一次性）
 
@@ -49,6 +66,8 @@ python "$SKILL/scripts/run.py" all     --input /input --work /app/work --output 
 - `finish` 固定顺序：套版 → `verify_pptx.verify` → `render_report.render` → `finalize.build` → `finalize.validate`；`run.py` 负责把 `<work>/*.json` 复制到 `<output>/evidence/`。
 - 缺任一审计模块时明确报 `auditor module missing` → `status=needs_human` + exit `3`；**不得自实现、不得静默跳过**。
 - **状态语义（v1.2）**：只有三类算 `needs_human`（exit `3`）——① `fidelity_report.ok=false`；② 关键格式项 fail；③ 审计模块缺失。**渲染器不可用只降级为 `partial` + exit `0`**（交付物可用、只是缺预览），但 `render_report.json` 的 `status` 仍必须如实写 `skipped`/`failed`。`prepare` 单独调用时只要侦察产物齐备即 exit `0`。
+- **模式与约束（v1.3）**：`prepare` 写出的计划已带 `mode`、`start_deck_path`、`audience`、`time_minutes`、`target_slide_count` 与 `constraints_applied`。要显式覆盖自动判定，只改 `/app/work/slides_plan.json` 里的 `mode` / `start_deck_path` / `constraints_applied`，**不要**新增命令行选项。`finish` 会按 `mode` 决定是否走起始 deck 适配，并把四项 v1.3 审计写进 `format_audit.json`。
+- **起始 deck 适配（`mode=adapt_start_deck`）**：输出包仍**整包继承模板**；带 `source_slide` 的页从起始 deck 读 `text_units` 与 `pictures`，按占位符签名映射到模板版式（title→title/ctrTitle，body→body/obj/subTitle，其余→替代文本框）；版面不足仍先阶梯后拆页，**不丢文本事实**；起始 deck 的图片按真实字节复制进 `ppt/media/` 并等比 contain，记 `figure_fit`。
 
 ### 模块函数签名（冻结，供接口核对，不是要求 Agent 改代码）
 
@@ -71,19 +90,24 @@ finalize.validate(work_dir, output_dir) -> dict         # 写 <output>/evidence/
 | `case_manifest.json` | `case_id`、原 `output_contract`（原样保留）、`required_fields`、每个输入的 `rel/kind/size/sha256`、`budget` |
 | `template_spec.json` | 真实 `slide_size`（`src` 指向实际 XPath）、`masters[]`、`layouts[].name/placeholders[]`、`theme[].fonts/colors`、`evidence[]` |
 | `source_inventory.json` | 源 `kind/sha256`、`sections[]`、`units[]`（含 `locator`）、`figures[]`（`label/caption/asset/width/height`）、`tables[]`、`extraction.status` |
-| `slides_plan.json` | 待你按证据编辑的唯一计划；自动生成的只是保守壳，不是答案 |
+| `slides_plan.json` | 待你按证据编辑的唯一计划；自动生成的只是保守壳，不是答案。重点确认 `mode`、`start_deck_path`、`constraints_applied`、每页 `source_slide`/`preserve_start_text`/`tables[]`/`notes_evidence[]` |
+| `start_deck_spec.json` | 起始 deck 的真实解析结果（v1.3）：`ok`、`slide_count`、`has_pictures`、`has_tables`、`notes_count` 与逐页 `slide_details[]`（`title`/`text_units[]`/`pictures[]`/`notes`/`tables[]`，全部带 `part` 定位）；`ok=false` 时按 §7 降级，**不要**据文件名假定内容 |
 | `plan_resolution.json` | 本次计划来自 `agent` / `auto_derived` / `unusable` 及理由 |
 
 长文用检索定位（`source_inventory.units[].locator`），不必把全文塞进上下文；**绝不能只凭文件名或错误领域标签补造内容**。
 
 ## 5. 计划关键字段（完整字段见 `references/plan_guide.md`）
 
+- `mode` / `start_deck_path`（v1.3）：`mode` 只取 `from_template` / `adapt_start_deck`（选定规则见 §1.1）；`start_deck_path` 是起始 deck 的真实相对路径，`from_template` 时为 `null`。不得填一个 manifest 里不存在的文件名。
+- `audience` / `time_minutes` / `target_slide_count` / `constraints_applied`（v1.3）：前三项来自 `case.json.constraints`，不得凭空编造；`target_slide_count` 是硬上限。`constraints_applied` 对 `audience` / `time_minutes` / `target_slide_count` / `font_size_floor_pt` / `caption_numbering` **逐项**记 `{"value": …, "source": "case.json:constraints.<key>"}`，作为"取自哪、值是多少"的审计留痕（案例未提供的项记 `null` 并在 `notes` 说明）。
+- `slides[].source_slide` / `slides[].preserve_start_text`（v1.3，仅 `adapt_start_deck`）：`source_slide` 是起始 deck 的 **1-based** 页号；`preserve_start_text=true` 表示该页文本必须保留（可重排/降号，不可删改事实）。`from_template` 时 `source_slide=null`、`preserve_start_text=false`。
+- `slides[].tables[]`（v1.3）：`{source, caption, header, rows, evidence[], caption_number}`；`source` 指向 `source_inventory.tables[].id`（如 `T1`），`header`/`rows` 是**真实单元格文本**（与 `source_inventory.tables[].header/rows` 一致，拿不到数据就留空并说明，不编造），`caption_number` 默认沿用源编号。每个表格条目由 `adapt_pptx.py` 渲染成真正的 `<a:tbl>`（见 §2 第 13 条）。
 - `confirmed_roles`：只有核查材料后才能置 `true`；角色冲突或候选不唯一时保持 `false` 并降级。
 - 每页 `layout_name` + `layout_part`：必须来自真实 `template_spec.layouts[]`；只按真实版式名匹配，不猜。
 - 形状命名（v1.2 §4.2）：无 `<p:ph>` 的替代文本框**必须**用固定 `p:cNvPr@name`——`Title`（title，下限 2400）/ `Content Placeholder`（body 有占位符，1400）/ `Substituted Body`（body，占位符缺失时的显式文本框，1400）/ `Figure Caption`（caption，1200）；角色判定**优先** `<p:ph>` 的 `idx/type`，没有 `<p:ph>` 才看 name，**禁止**用"文本以图号开头"这类文本模式判角色。
 - `bullets[].evidence`：每条要点指向 `source_inventory` 的 `units[].id`（`u0012`）或 `figures[].id`。
 - `figures[].aspect_lock`：默认 `true`；`source` 指向 `F1`，`asset` 是真实相对路径，`cite` 指向源单元。
-- `notes` / `notes_evidence`：讲稿备注与其来源，保证备注不是凭空生成。
+- `notes` / `notes_evidence`：`notes` 是**可朗读的讲稿句**（本页主张 → 依据 → 与下一页衔接），`notes_evidence` 是其来源单元 id 列表（`uXXXX` / `S2` / `F1` / `T1`），**必填且非空**；讲稿内容 token 必须能在这些 evidence 的源文本里找到（见 §2 第 14 条）。
 - `font_ladder` / `numbering` / `contract_values`：字号阶梯（含 `floor`）、图号策略（默认 `preserve_source`）、原合同 dotted path → 真实字段的映射。
 - `continuation_of`：拆页后第 2 页指向被拆的原页号，便于复核"拆页而非删字"。
 
@@ -95,7 +119,7 @@ finalize.validate(work_dir, output_dir) -> dict         # 写 <output>/evidence/
 |---|---|
 | `adaptation_actions.json` | 每个改动有 `before/after/evidence`；没有"文本改写"伪装成排版 |
 | `fidelity_report.json` | `ok=true`；`metrics.unsourced_deck_strings` 与 `violations[]` 无未解释项；无改写、丢字、图号错位 |
-| `format_audit.json` | `status` 与每项 `status` 有实测 `expected/observed/evidence`；未检查项没被算成 PASS |
+| `format_audit.json` | `status` 与每项 `status` 有实测 `expected/observed/evidence`；未检查项没被算成 PASS；v1.3 四项新检查 `start_deck_preserved` / `table_rendered` / `constraints_honoured` / `notes_evidence_present` 都在 `checks[]` 里且状态诚实（`from_template` 下 `start_deck_preserved` 应为 `skipped` 而非 `pass`） |
 | `render_report.json` | `status` 真实；登记进 `artifacts`/`pages` 的文件确实存在且非空；字体证据来自真实工具 |
 | `result.json` | 保留原 `output_contract`、artifacts/hash 指向最终文件、`status` 与缺口没被覆盖 |
 | `evidence/validation_report.json` | `finalize.validate` 的合同自检结果（`ok` 及未填字段） |
@@ -107,6 +131,8 @@ finalize.validate(work_dir, output_dir) -> dict         # 写 <output>/evidence/
 | **needs_human** | 三类（与 `CONTRACT.md` §4 v1.2 逐字对应）：① `fidelity_report.ok=false`；② 关键格式项 fail；③ 审计模块缺失（`auditor module missing`） | 3 | `result.json` + 已产出的 work json；缺口写进 `open_items.uncertainty/limitations` |
 
 > `needs_human` 的编码细节：`/input/case.json` 不可读或参数校验失败时 exit `2`，但**仍必须写出 `needs_human` 结果**；其余三类 exit `3`。角色/模板无法确认、无法产出可用 deck 的极端情形不属于上表三类，也不得据此伪造完整的 `ok`/`partial` 交付——仍要写出诚实的 `result.json` 与已有中间产物，并把缺口记入 `open_items`。
+
+> **v1.3 四项检查的严重度**：`start_deck_preserved` / `table_rendered` / `constraints_honoured` / `notes_evidence_present` 任一项 `fail` 都按**关键格式项 fail** 处理（落 `needs_human`，exit `3`），因为它们直接影响题面明确要求的能力；只有 `skipped`（案例不适用/无起始 deck/无表格/无约束）才降为 `partial`。`skipped` **不是** `pass`，必须同时出现在 `format_audit.unchecked[]` 或该项的 `detail` 里。
 
 > **诚实降级（v1.2）**：`fidelity_report.ok=false`、关键格式项 fail、审计模块缺失 → 降级并 exit `3`（落 `needs_human`）；**渲染 `status=skipped`/`failed` 只降为 `partial` + exit `0`**，但状态字段必须如实写 `skipped`/`failed`。`skipped` 不是 `pass`。若 engine 的实现与本节某一格不同，**以 `CONTRACT.md` 为准**并报告，不要靠文字把状态写成通过。
 
@@ -122,14 +148,16 @@ finalize.validate(work_dir, output_dir) -> dict         # 写 <output>/evidence/
 | **字体缺失** | 主题字体只在 `theme[].fonts` 有真实证据时保留/设置；渲染后字体被替换时，把 `substitutions[]` 写进 `render_report.fonts`（`pdffonts`/`soffice-log` 证据）；不假装字体已嵌入，也不因缺失改版面结构。 |
 | **图表源失效** | `figures[].asset` 不存在或不可解析时，保留 `source` 与 `caption`/`cite`，`asset=null`，在 `figures[]`/`open_items` 说明缺图；**不得**用占位图冒充原图，不得编造数据。 |
 | **渲染失败 / 无渲染器** | 探测不到渲染器：`render_report.status="skipped"`，`preview/` 缺席，`attempts[]` 写明探测过程，**不得伪造预览**；按 v1.2 该情形降为 **`partial` + exit `0`**（交付物可用、只缺预览）。渲染器存在但失败：`status="failed"` 并记渲染器与错误，同样为 `partial`。 |
-| **源非可解析格式** | `source_inventory.extraction.status=failed` 时保留原始材料与定位信息，`text_available=false`，只做有证据支持的最小交付并记 `limitations`；不得依据文件名臆造正文。 |
+| **源非可解析格式** | `source_inventory.extraction.status=failed` 时保留原始材料与定位信息，`text_available=false`，只做有证据支持的最小交付并记 `limitations`；不得依据文件名臆造正文。PDF 走真实探测链（`pdftotext` → `mutool draw -F txt` → `pypdf`/`PyPDF2`/`pdfplumber`/`fitz` → PATH 上的 `pdf-text-tool`/`pdftext`/`ds-pdf-text` 或 `$PDF_TEXT_TOOL`），每次尝试记进 `extraction.attempts[]`；**PDF 没有文本层或扫描件**时 `units=[]` + `status=failed`，**不得**用文件名、目录名或领域标签补造正文。 |
+| **起始 deck 与模板版式不兼容（v1.3）** | `mode=adapt_start_deck` 时该页的 `placeholder_signature` 在模板版式里找不到对应占位符：按签名逐类降级映射（title→title/ctrTitle，body→body/obj/subTitle，其余→替代文本框）并记 `placeholder_substitute`；整页结构无法安全承载时退到语义最近的真实版式（或 `title`/`blank`），**文本单元一个都不能丢**；实在承载不了的记 `unresolved` 并降级，`start_deck_preserved` 如实判 `fail`/`skipped`，不得声称"已适配"。 |
+| **表格过宽（v1.3）** | 列数/文本宽度超出页宽的，先按内容分配列宽（`table_col_widths`），允许缩小表格字号到 `caption`/`table` 下限 1200（1/100 pt）；仍放不下就**拆成多个 `<a:tbl>`**（续页或同页分段，表号加 "(续)"）并记 `table_split`；**不允许**把表格改成图片、删列或截断单元格文字冒充完整。截断只允许发生在展示层，且必须在 `format_audit` 里记 `table_truncated` + 原值 hash。 |
 | **源是 legacy `.ppt` / 宏 `.pptm`** | 保留原件，不尝试编辑；按 `limitations.md` 的未支持路径处理并降级。 |
 
 ## 8. 可复用材料
 
 - `README.md`：安装、Linux/Windows 独立调用、输入输出清单、逐页复核步骤、资源上限自检。
-- `references/plan_guide.md`：`slides_plan.json` 全字段、证据优先级、冲突处置、占位符缺失时的固定形状命名（v1.2 §4.2）、auto-derived 兜底规则。
-- `references/result_contract.md`：`result.json` 全字段、原 `output_contract` 与 `contract_path_map`、`unfilled_fields`、状态语义、形状命名与角色判定、真实性要求。
+- `references/plan_guide.md`：`slides_plan.json` 全字段（含 v1.3 的 `mode`/`start_deck_path`/`constraints_applied`/`source_slide`/`preserve_start_text`/`tables[]`/`notes_evidence[]`）、证据优先级、冲突处置（含起始 deck 内容与源材料冲突时以源材料为事实基准）、占位符缺失时的固定形状命名（v1.2 §4.2）、auto-derived 兜底规则。
+- `references/result_contract.md`：`result.json` 全字段（含 `plan.constraints_applied`）、原 `output_contract` 与 `contract_path_map`、`unfilled_fields`、状态语义、`format_audit` 的 v1.3 四项检查与 `fidelity_report.notes_evidence` 语义、形状命名与角色判定、真实性要求。
 - `references/limitations.md`：支持范围、明确不支持项与每类诚实处置。
 - `examples/`：标 `example=true` / EXAMPLE 的合成最小接口示例，**不是**正式案例、不是答案、不代表评分。
 
