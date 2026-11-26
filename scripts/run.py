@@ -99,12 +99,121 @@ def _int_from_constraints(constraints, keys):
     return None
 
 
+def _constraints(man):
+    """Read the frozen case constraints and record where every value came from (v1.3 §A2)."""
+    c = man.get("constraints") or {}
+    if not isinstance(c, dict):
+        c = {}
+    applied = {}
+
+    def take(key):
+        if key in c and c[key] is not None:
+            applied[key] = {"value": c[key], "source": "case.json:constraints.%s" % key}
+            return c[key]
+        return None
+
+    return {
+        "audience": take("audience"),
+        "time_minutes": take("time_minutes"),
+        "target_slide_count": take("target_slide_count"),
+        "font_size_floor_pt": take("font_size_floor_pt"),
+        "caption_numbering": take("caption_numbering"),
+        "language": take("language"),
+        "aspect": take("aspect"),
+        "masters_min": take("masters_min"),
+        "layouts_min": take("layouts_min"),
+    }, applied
+
+
+def _floor_from_constraints(fc):
+    """constraints.font_size_floor_pt is in points; our ladder floor is in 1/100 pt."""
+    floor = dict(C.FONT_FLOOR)
+    if isinstance(fc, dict):
+        for role in ("body", "caption", "title", "table"):
+            v = fc.get(role)
+            if isinstance(v, (int, float)) and v > 0:
+                floor[role] = int(round(float(v) * 100))
+    return floor
+
+
+def _start_deck_slides(sd):
+    """Plan entries derived from the organizer-provided starting deck.
+
+    v1.3 §A3: the start deck's text is preserved (re-laid-out and possibly re-split, never
+    reworded).  Pictures are referenced by their part name inside the start deck so the
+    adapter can copy the real bytes.
+    """
+    out = []
+    for det in (sd.get("slide_details") or []):
+        units = det.get("text_units") or []
+        title = (det.get("title") or "").strip()
+        if not title:
+            for u in units:
+                if (u.get("where") or "") == "title" and (u.get("text") or "").strip():
+                    title = (u.get("text") or "").strip()
+                    break
+        bullets = []
+        for u in units:
+            t = (u.get("text") or "").strip()
+            if not t or (u.get("where") or "") == "title" or t == title:
+                continue
+            bullets.append({"text": _clip(t), "level": int(u.get("level") or 0), "evidence": []})
+        figs = []
+        for pic in (det.get("pictures") or []):
+            figs.append({"source_deck_media": pic.get("rel"), "sha256": pic.get("sha256"),
+                         "aspect_lock": True, "caption": None})
+        tables_here = []
+        for t in (det.get("tables") or []):
+            tables_here.append({"source": None, "caption": None, "header": [], "rows": [],
+                                "evidence": [], "start_deck_table": t})
+        entry = {
+            "role": "start_deck",
+            "title": _clip(title, 160),
+            "bullets": bullets,
+            "figures": figs,
+            "tables": tables_here,
+            "source_slide": det.get("index"),
+            "preserve_start_text": True,
+            "claims": [],
+            "evidence": [],
+            "start_deck_part": det.get("part"),
+            "notes_evidence": ["start_deck:%s" % det.get("part")],
+        }
+        if det.get("layout_name"):
+            entry["start_layout_name"] = det["layout_name"]
+        if det.get("placeholder_signature"):
+            entry["placeholder_signature"] = det["placeholder_signature"]
+        if det.get("placeholder_types"):
+            entry["placeholder_types"] = det["placeholder_types"]
+        if det.get("layout_probe"):
+            entry["start_layout_probe"] = det["layout_probe"]
+        out.append(entry)
+    return out
+
+
+def _covered_by_start(title, start_slides):
+    """Is this section already represented by a start-deck slide?"""
+    key = C.norm_key(_plain(title or ""))
+    if not key:
+        return False
+    for s in start_slides:
+        other = C.norm_key(_plain(s.get("title") or ""))
+        if other and (key in other or other in key):
+            return True
+        for b in (s.get("bullets") or []):
+            bt = C.norm_key(_plain(b.get("text") or ""))
+            if bt and key in bt:
+                return True
+    return False
+
+
 def derive_plan(work):
-    """Evidence-only conservative plan: roles already confirmed by discover, no invention."""
+    """Evidence-only conservative plan (v1.3): honours start deck + frozen constraints."""
     man = _j(work, "case_manifest.json", {}) or {}
     spec = _j(work, "template_spec.json", {}) or {}
     inv = _j(work, "source_inventory.json", {}) or {}
-    constraints = man.get("constraints") or {}
+    sd = _j(work, "start_deck_spec.json", {}) or {}
+    cons, applied = _constraints(man)
     sections = inv.get("sections") or []
     units = inv.get("units") or []
     figures = inv.get("figures") or []
@@ -126,7 +235,6 @@ def derive_plan(work):
             out["layout_part"] = part
         return out
 
-    # unit ids -> locator for the evidence map
     loc = {}
     for u in units:
         loc[u.get("id")] = u.get("locator") or u.get("id")
@@ -150,25 +258,34 @@ def derive_plan(work):
     title_text = title_text or man.get("case_id") or "Presentation"
     title_text = _clip(title_text, 160)
 
-    cap = _int_from_constraints(constraints, ["slide_count", "target_slide_count", "slides",
-                                              "num_slides", "pages", "max_slides"]) or 16
+    use_start = bool(sd.get("ok")) and int(sd.get("slide_count") or 0) > 0
+    mode = "adapt_start_deck" if use_start else "from_template"
+    cap = int(cons["target_slide_count"]) if isinstance(cons.get("target_slide_count"), (int, float)) \
+        and cons["target_slide_count"] > 0 else 16
     per_slide = 5
 
-    slides = []
-    # 1 cover
-    slides.append({"role": "title", "title": title_text,
-                   "subtitle": (inv.get("source_path") and os.path.basename(inv["source_path"])) or "",
-                   "claims": ["研究主线来自源材料"], "evidence": [u.get("id") for u in units[:2]],
-                   "notes": _notes_for([u for u in units[:2]], loc), **layout_fields("title")})
+    start_slides = _start_deck_slides(sd) if use_start else []
+    slides = list(start_slides)
+
+    # 1 cover (only when the start deck does not already carry one)
+    if not (use_start and start_slides and start_slides[0].get("source_slide") == 1):
+        slides.append({"role": "title", "title": title_text,
+                       "subtitle": (inv.get("source_path") and os.path.basename(inv["source_path"])) or "",
+                       "claims": [], "evidence": [u.get("id") for u in units[:2]],
+                       "notes_evidence": [u.get("id") for u in units[:2]],
+                       **layout_fields("title")})
     # 2 outline
     outline = [{"text": _plain(s.get("title") or ""), "level": 0}
                for s in sections if (s.get("title") or "").strip()][:8]
     if outline:
         slides.append({"role": "outline", "title": "Outline", "bullets": outline,
-                       "claims": ["页序对应源材料章节"], "evidence": [s.get("id") for s in sections[:8]],
-                       "notes": _notes_for_sections(sections[:8]), **layout_fields("content")})
-    # 3 per-section content
+                       "claims": [], "evidence": [s.get("id") for s in sections[:8]],
+                       "notes_evidence": [s.get("id") for s in sections[:8]],
+                       **layout_fields("content")})
+    # 3 per-section content, skipping sections the start deck already covers
     for s in sections:
+        if use_start and _covered_by_start(s.get("title") or "", start_slides):
+            continue
         su = by_section.get(s.get("id")) or []
         if not su:
             continue
@@ -180,78 +297,116 @@ def derive_plan(work):
             slides.append({"role": "content", "title": _plain(s.get("title") or "Section"),
                            "bullets": [{"text": _clip(u.get("text_plain") or u.get("text") or ""),
                                         "level": 0, "evidence": [u.get("id")]} for u in chunk],
-                           "claims": [(s.get("title") or "").strip()],
-                           "evidence": [u.get("id") for u in chunk],
-                           "notes": _notes_for(chunk, loc), **layout_fields("content")})
+                           "claims": [], "evidence": [u.get("id") for u in chunk],
+                           "notes_evidence": [u.get("id") for u in chunk],
+                           **layout_fields("content")})
     # 4 figure slides
     for f in figures:
         cap_text = _plain(f.get("caption_plain") or f.get("caption") or f.get("label") or "Figure")
-        slides.append({"role": "figure", "title": (f.get("label") or "Figure"),
+        slides.append({"role": "figure", "title": _plain(f.get("label") or "Figure"),
                        "bullets": [], "figures": [{"source": f.get("id"), "asset": f.get("asset"),
                                                    "caption": cap_text, "aspect_lock": True,
                                                    "label": f.get("label")}],
-                       "claims": [cap_text], "evidence": [f.get("id")],
-                       "notes": _notes_for([{"id": f.get("id"), "locator": f.get("source_ref") or f.get("id")}], loc),
+                       "claims": [], "evidence": [f.get("id")],
+                       "notes_evidence": [f.get("id")],
                        **layout_fields("content")})
-    # 5 tables
+    # 5 tables: a real editable <a:tbl> only when the source really has cells; otherwise keep
+    # the caption honestly and record that the data was not extractable (v1.3 §A3).
+    tables_unavailable = []
     for t in tables:
         cap_text = _plain(t.get("caption_plain") or t.get("caption") or t.get("label") or "Table")
-        slides.append({"role": "table", "title": (t.get("label") or "Table"),
-                       "bullets": [{"text": cap_text[:180], "level": 0}],
-                       "claims": [cap_text], "evidence": [t.get("id")],
-                       "notes": _notes_for([{"id": t.get("id"), "locator": t.get("source_ref") or t.get("id")}], loc),
-                       **layout_fields("content")})
-    # 6 conclusion (last section's units, if not already the tail)
+        header = [str(x) for x in (t.get("header") or [])]
+        rows = [[str(c) for c in r] for r in (t.get("rows") or [])]
+        if header or rows:
+            slides.append({"role": "table", "title": _plain(t.get("label") or "Table"),
+                           "bullets": [], "tables": [{"source": t.get("id"), "caption": cap_text,
+                                                      "header": header, "rows": rows,
+                                                      "evidence": [t.get("id")],
+                                                      "caption_number": t.get("label")}],
+                           "claims": [], "evidence": [t.get("id")],
+                           "notes_evidence": [t.get("id")],
+                           **layout_fields("content")})
+        else:
+            tables_unavailable.append({"id": t.get("id"), "caption": cap_text,
+                                       "data_note": t.get("data_note") or "no real cells extractable",
+                                       "evidence": [t.get("id")]})
+            slides.append({"role": "table_caption", "title": _plain(t.get("label") or "Table"),
+                           "bullets": [{"text": _clip(cap_text), "level": 0, "evidence": [t.get("id")]}],
+                           "claims": [], "evidence": [t.get("id")],
+                           "notes_evidence": [t.get("id")],
+                           **layout_fields("content")})
+    # 6 conclusion
     if sections:
         last = sections[-1]
         lu = by_section.get(last.get("id")) or []
-        if lu and (not slides or slides[-1].get("evidence") != [u.get("id") for u in lu[:per_slide]]):
+        if lu and not (use_start and _covered_by_start(last.get("title") or "", start_slides)):
             slides.append({"role": "conclusion", "title": "Conclusion",
                            "bullets": [{"text": _clip(u.get("text_plain") or u.get("text") or ""),
                                         "level": 0, "evidence": [u.get("id")]} for u in lu[:per_slide]],
-                           "claims": ["结论对应源材料"], "evidence": [u.get("id") for u in lu[:per_slide]],
-                           "notes": _notes_for(lu[:per_slide], loc), **layout_fields("content")})
+                           "claims": [], "evidence": [u.get("id") for u in lu[:per_slide]],
+                           "notes_evidence": [u.get("id") for u in lu[:per_slide]],
+                           **layout_fields("content")})
 
+    # hard cap on slide count (v1.3 §A5 constraints_honoured).
+    # Priority when trimming: start-deck slides (content must be preserved), then the six
+    # required page types (title/table/figure/conclusion), and only then redundant body pages.
     if len(slides) > cap:
-        head = slides[:max(1, cap - 1)]
-        tail = slides[-1]
-        if tail in head:
-            slides = head
+        must_roles = ("start_deck", "title", "table", "table_caption", "figure", "conclusion")
+        must = [s for s in slides if s.get("role") in must_roles]
+        optional = [s for s in slides if s.get("role") not in must_roles]
+        room = cap - len(must)
+        if room < 0:
+            # even the required pages exceed the cap: keep order, drop the least critical first
+            order = {"start_deck": 0, "title": 1, "conclusion": 2, "table": 3, "figure": 4}
+            must.sort(key=lambda s: order.get(s.get("role"), 9))
+            keep = set(id(s) for s in must[:cap])
         else:
-            slides = head + [tail]
+            keep = set(id(s) for s in must) | set(id(s) for s in optional[:room])
+        slides = [s for s in slides if id(s) in keep]
     for i, s in enumerate(slides, 1):
         s["n"] = i
 
+    # narration + evidence (v1.3 §A4) — quoted verbatim from each slide's own evidence
+    ev_text = _evidence_text_map(inv, sd)
+    for i, s in enumerate(slides):
+        nxt = (slides[i + 1].get("title") if i + 1 < len(slides) else "")
+        if not (s.get("notes_evidence") or []):
+            s["notes_evidence"] = [u.get("id") for u in (s.get("evidence") or []) if u] or \
+                                  [s.get("start_deck_part") or "case:title"]
+        s["notes"] = _narration(s, ev_text, nxt)
+
     deck_name = C.DECK_DEFAULT_NAME
     for k in ("deck_name", "output_name", "primary_output", "deliverable_name"):
-        v = constraints.get(k) if isinstance(constraints, dict) else None
+        v = (man.get("constraints") or {}).get(k) if isinstance(man.get("constraints"), dict) else None
         if isinstance(v, str) and v.lower().endswith(".pptx"):
             deck_name = os.path.basename(v)
             break
 
+    caption_mode = cons.get("caption_numbering")
     plan = {
-        "plan_version": "1", "example": False,
+        "plan_version": "1.3", "example": False,
+        "mode": mode,
         "source_path": inv.get("source_path"),
         "template_path": spec.get("template_path") or (man.get("detected") or {}).get("template", [None])[0],
-        "start_deck": (man.get("detected") or {}).get("start_deck", [None])[0] if (man.get("detected") or {}).get("start_deck") else None,
+        "start_deck_path": (sd.get("path") if use_start else None),
         "deck_name": deck_name,
-        "language": "zh" if _looks_cjk(title_text) else "en",
-        "audience": "academic audience (from case materials)",
-        "time_minutes": None,
-        "target_slide_count": len(slides),
+        "language": cons.get("language") or ("zh" if _looks_cjk(title_text) else "en"),
+        "audience": cons.get("audience"),
+        "time_minutes": cons.get("time_minutes"),
+        "target_slide_count": cap,
+        "constraints_applied": applied,
+        "tables_unavailable": tables_unavailable,
         "confirmed_roles": True,
         "slides": slides,
         "font_ladder": {"title": [3200, 2800, 2400], "body": [2000, 1800, 1600, 1400],
                         "caption": [1400, 1200],
-                        "floor": {"body": C.FONT_FLOOR["body"], "caption": C.FONT_FLOOR["caption"],
-                                  "title": C.FONT_FLOOR["title"]}},
-        "numbering": {"mode": "preserve_source",
+                        "floor": _floor_from_constraints(cons.get("font_size_floor_pt"))},
+        "numbering": {"mode": caption_mode if caption_mode in ("preserve_source", "relabel") else "preserve_source",
                       "map": ["%s=%s" % (f.get("id"), f.get("label")) for f in figures if f.get("label")]},
         "contract_values": _contract_values(man),
         "plan_source": "auto_derived",
-        "notes": ["conservative plan derived only from discovered evidence; "
-                  "roles/layouts/counts come from case_manifest.json, template_spec.json and "
-                  "source_inventory.json — nothing was invented"],
+        "notes": ["plan derived only from discovered evidence; mode=%s; start_deck_slides=%d; "
+                  "target_slide_count=%s (case constraint)" % (mode, len(start_slides), cap)],
     }
     return plan
 
@@ -283,21 +438,56 @@ def _clip(text, limit=200):
     return head.rstrip() + "…"
 
 
-def _notes_for(units, loc):
-    """Speaker notes that only restate source locations — never invent content."""
-    refs = []
-    for u in units or []:
-        if not u:
-            continue
-        r = loc.get(u.get("id")) or u.get("locator") or u.get("id")
-        if r:
-            refs.append(str(r))
-    return ("来源：" + "；".join(refs)) if refs else ""
+def _evidence_text_map(inv, sd):
+    """unit/section/figure/table id -> its own source text (used to keep notes traceable)."""
+    m = {}
+    for u in (inv.get("units") or []):
+        if u.get("id"):
+            m[str(u["id"])] = _plain(u.get("text_plain") or u.get("text") or "")
+    for s in (inv.get("sections") or []):
+        if s.get("id"):
+            m[str(s["id"])] = _plain(s.get("title") or "")
+    for f in (inv.get("figures") or []):
+        if f.get("id"):
+            m[str(f["id"])] = _plain((f.get("label") or "") + " " + (f.get("caption_plain") or f.get("caption") or ""))
+    for t in (inv.get("tables") or []):
+        if t.get("id"):
+            m[str(t["id"])] = _plain((t.get("label") or "") + " " + (t.get("caption_plain") or t.get("caption") or ""))
+    for det in (sd.get("slide_details") or []):
+        if det.get("part"):
+            m["start_deck:%s" % det["part"]] = " ".join(
+                _plain(u.get("text") or "") for u in (det.get("text_units") or []))
+    return m
 
 
-def _notes_for_sections(sections):
-    names = [str(s.get("title") or s.get("id")) for s in (sections or []) if s]
-    return ("章节顺序：" + "；".join(names)) if names else ""
+def _narration(slide, ev_text=None, next_title=None):
+    """A speakable script made **entirely** of text the slide's evidence points at (v1.3 §A4).
+
+    Trade-off, stated plainly: this is a presenter script assembled from the page's own key
+    sentences in order, not authored prose.  That is deliberate — an auditor must be able to
+    check every content token against the evidence, and authored connective words would be
+    unsourced tokens.  The title is prepended only when it actually occurs in the evidence
+    text, so the notes stay 100% traceable.  Page order, claims and the evidence map carry
+    the narrative logic.
+    """
+    ev_text = ev_text or {}
+    texts = []
+    for eid in (slide.get("notes_evidence") or []):
+        t = (ev_text.get(str(eid)) or "").strip()
+        if t:
+            texts.append(_clip(t, 160))
+    blob = " ".join(texts)
+    key = C.norm_key(blob)
+    parts = []
+    title = (slide.get("title") or "").strip()
+    if title and key and C.norm_key(title) and C.norm_key(title) in key:
+        parts.append(title + "。")
+    parts.extend(texts[:3])
+    if not parts:
+        return ""
+    return " ".join(parts)
+
+
 
 
 def _contract_values(man):
