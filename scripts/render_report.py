@@ -269,8 +269,15 @@ def _try_soffice(binary, deck_path, preview_dir, attempts):
     cmd = [binary, "--headless", "--norestore", "--nolockcheck",
            "-env:UserInstallation=file:///" + rf.replace("\\", "/"),
            "--convert-to", "pdf", "--outdir", preview_dir, deck_path]
-    rc, out, err = _run(cmd)
     produced = os.path.join(preview_dir, os.path.splitext(os.path.basename(deck_path))[0] + ".pdf")
+    if os.path.exists(produced):
+        # same re-entrancy guard as the kit path: a stale target must not downgrade the run
+        try:
+            os.remove(produced)
+        except OSError:
+            shutil.rmtree(preview_dir, ignore_errors=True)
+            os.makedirs(preview_dir, exist_ok=True)
+    rc, out, err = _run(cmd)
     detail = "rc=%s out=%s err=%s" % (rc, out.strip()[:200], err.strip()[:200])
     attempts.append({"renderer": os.path.basename(binary), "status": "ok" if rc == 0 else "failed",
                      "detail": detail})
@@ -301,6 +308,14 @@ def _try_kit(cand, deck_path, preview_dir, attempts):
                      "detail": "rc=%s pages=%s err=%s" % (rc_r, rinfo.get("pageCount"),
                                                           (err_r or "").strip()[:200])})
     pdf_out = os.path.join(preview_dir, PDF_NAME)
+    # the renderer refuses to overwrite an existing target (EEXIST -> "skipped", which would
+    # silently downgrade delivery to partial on a re-run in the same directory)
+    if os.path.exists(pdf_out):
+        try:
+            os.remove(pdf_out)
+        except OSError:
+            shutil.rmtree(preview_dir, ignore_errors=True)
+            os.makedirs(preview_dir, exist_ok=True)
     rc_c, out_c, err_c = _run([node, cli, "convert", "--input", deck_path, "--output", pdf_out])
     cinfo = _json_from_stdout(out_c) or {}
     attempts.append({"renderer": "libreoffice-kit:convert",
