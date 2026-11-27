@@ -942,7 +942,7 @@ class Adapter:
                 tree.append(_placeholder_sp(self._next_shape_id(), "Content Placeholder",
                                            body_key[0], body_key[1], (body_info or {}).get("xfrm"),
                                            body_paras, chosen, body_pr=(body_info or {}).get("body_pr"),
-                                           bullet=True))
+                                           bullet=not plan_slide.get("no_bullets")))
                 added.append("body")
                 self.record(n, "placeholder_fill", "ppt/slides/slide%d.xml" % n, None,
                             {"ph": list(body_key), "sz": chosen, "bullets": len(body_paras)}, layout_part)
@@ -951,7 +951,8 @@ class Adapter:
                                          "cy": size["cy"] - 2286000}
                 synth = {"x": sub_rect["x"], "y": sub_rect["y"], "cx": sub_rect["cx"], "cy": sub_rect["cy"]}
                 tree.append(_placeholder_sp(self._next_shape_id(), "Substituted Body", None, None,
-                                           synth, body_paras, chosen, substituted=True, bullet=True))
+                                           synth, body_paras, chosen, substituted=True,
+                                           bullet=not plan_slide.get("no_bullets")))
                 added.append("body_substituted")
                 self.action("placeholder_substitute", n, layout_part, "layout has no body placeholder",
                             "explicit text box inside the largest declared rect",
