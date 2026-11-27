@@ -87,10 +87,18 @@ def _norm(s):
 
 
 def _tokens(s):
-    """CJK single chars + ASCII/digit words. Deterministic, no dictionary needed."""
+    """CJK letters + ASCII/digit words. Deterministic, no dictionary needed.
+
+    The CJK class is **letters only** (Ext-A / unified ideographs / kana / Hangul).
+    It deliberately excludes U+2E80–U+33FF (CJK radicals and CJK symbols & punctuation,
+    e.g. ``。`` U+3002, ``、`` U+3001, ``「`` U+300C) and full-width forms U+FF00–U+FFEF:
+    punctuation is not a content token, otherwise every correctly punctuated sentence
+    would "lose" coverage against its evidence text.
+    """
     s = unicodedata.normalize("NFKC", s or "")
     out = []
-    for m in re.finditer(r"[A-Za-z][A-Za-z0-9_.\-]*|\d+(?:\.\d+)?%?|[\u2E80-\u9FFF\uAC00-\uD7A3]", s):
+    for m in re.finditer(r"[A-Za-z][A-Za-z0-9_.\-]*|\d+(?:\.\d+)?%?|"
+                         r"[\u3400-\u4DBF\u4E00-\u9FFF\u3040-\u30FF\uAC00-\uD7A3]", s):
         out.append(m.group(0).lower())
     return out
 
@@ -762,6 +770,30 @@ def _table_matches(cells, want):
     return True
 
 
+def _inventory_item_text(item):
+    """Fullest available text of a source_inventory figure/table entry.
+
+    Order: ``label`` + ``caption_plain`` (markdown stripped; falls back to ``caption``),
+    then every real ``header``/``rows`` cell.  Table numbers live in the cells, so they
+    must be part of the evidence corpus or a script citing the table looks unsourced.
+    """
+    if not isinstance(item, dict):
+        return ""
+    parts = [str(item.get("label") or "")]
+    plain = item.get("caption_plain")
+    if isinstance(plain, str) and plain.strip():
+        parts.append(plain)
+    else:
+        parts.append(str(item.get("caption") or ""))
+    for key in ("header", "rows"):
+        for row in (item.get(key) or []):
+            if isinstance(row, (list, tuple)):
+                parts.extend(str(cell) for cell in row)
+            else:
+                parts.append(str(row))
+    return " ".join(p for p in parts if p)
+
+
 def _evidence_index(inv, start_spec=None):
     """notes_evidence id -> source text (units / sections / figures / tables).
 
@@ -779,7 +811,7 @@ def _evidence_index(inv, start_spec=None):
     for key in ("figures", "tables"):
         for it in (inv.get(key) or []):
             if isinstance(it, dict) and it.get("id"):
-                idx[str(it["id"])] = "%s %s" % (it.get("label") or "", it.get("caption") or "")
+                idx[str(it["id"])] = _inventory_item_text(it)
     for sd in ((start_spec or {}).get("slide_details") or []):
         if not isinstance(sd, dict):
             continue
@@ -1057,11 +1089,12 @@ def _fidelity_notes(deck, plan, inv, start_spec=None):
             bad.append({"slide": None, "kind": "deck_unsourced_number",
                         "why": "deck notes numbers absent from evidence: %s" % stat_bad})
 
-    rules = ("rules: content-token coverage >= %.0f%% after removing %d connector/stopword "
-             "tokens; every statistic must appear verbatim in the evidence texts; "
-             "unresolved=%d low_overlap=%d unsourced_number=%d missing_evidence=%d "
+    rules = ("rules: content tokens = CJK letters + numbers/ASCII words (punctuation is "
+             "never a content token) minus %d connector/stopword tokens; content-token "
+             "coverage >= %.0f%%; every statistic must appear verbatim in the evidence "
+             "texts; unresolved=%d low_overlap=%d unsourced_number=%d missing_evidence=%d "
              "deck_low_overlap=%d deck_unsourced_number=%d"
-             % (threshold * 100.0, len(_NOTES_STOP), unresolved, low_overlap,
+             % (len(_NOTES_STOP), threshold * 100.0, unresolved, low_overlap,
                 stat_leak, missing_evidence, deck_low_overlap, deck_stat_leak))
     if not bad:
         chk = _check(name, "pass", "every slide with notes has non-empty resolvable "
